@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>素材库 · E 盘检索</title>
+<link rel="stylesheet" href="/static/style.css?v=20261022">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="mark"></span>
+    <span class="name">素材库</span>
+  </div>
+
+  <div class="searchwrap">
+    <div class="searchbox" id="searchbox">
+      <div class="qthumb" id="qthumb" hidden><img id="qthumbImg" alt="当前搜索图"></div>
+      <svg class="icon" viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">
+        <circle cx="8.5" cy="8.5" r="5.5" fill="none" stroke="currentColor" stroke-width="1.6"/>
+        <path d="M12.8 12.8L17 17" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+      </svg>
+      <input id="q" type="search" placeholder="搜文件名或路径，也可以把图片拖进来…" autocomplete="off" spellcheck="false">
+      <span class="qprog" id="qprog" hidden></span>
+      <button class="clear" id="clearq" title="清空" hidden>&times;</button>
+      <button class="clear qx" id="qimgClear" title="退出以图搜图" hidden>&times;</button>
+      <div class="qbar" id="qbar" hidden><i id="qbarFill"></i></div>
+    </div>
+    <div class="modes" role="tablist">
+      <button class="mode on" data-mode="name" role="tab">名称</button>
+      <button class="mode" data-mode="image" role="tab" id="modeImage">画面</button>
+    </div>
+    <label class="upload" title="上传一张图，找相似素材（支持 JPG / PSD / TIFF / RAW / AI / PDF）">
+      <input type="file" id="fileInput" accept="image/*,.psd,.psb,.ai,.tif,.tiff,.dng,.arw,.cr2,.cr3,.nef,.pdf,.pptx" hidden>
+      <span>以图搜图</span>
+    </label>
+  </div>
+
+  <div class="status" id="status">
+    <span class="dot"></span><span id="statusText">准备中</span>
+  </div>
+</header>
+
+<div class="filters" id="filters">
+  <div class="fgroup" id="kindChips"></div>
+  <div class="fgroup" id="topChips"></div>
+  <div class="fspacer"></div>
+  <div class="fgroup">
+    <button class="chip ghost" id="rescanBtn">重新扫描</button>
+  </div>
+</div>
+
+<main>
+  <div class="meta-line" id="metaLine"></div>
+  <div class="grid" id="grid"></div>
+  <div class="empty" id="empty" hidden>
+    <p class="et">没有匹配的素材</p>
+    <p class="es">试试更短的关键词，或者换个筛选条件</p>
+  </div>
+  <div class="sentinel" id="sentinel"></div>
+  <div class="loading" id="loading" hidden><span></span>加载中</div>
+</main>
+
+<div class="dropzone" id="dropzone">
+  <div class="dzinner">
+    <div class="dzicon"></div>
+    <p>松手即可搜索相似素材</p>
+  </div>
+</div>
+
+<div class="lightbox" id="lightbox" hidden>
+  <div class="lb-backdrop" data-close></div>
+  <div class="lb-panel">
+    <button class="lb-close" data-close>&times;</button>
+    <div class="lb-imgwrap"><img id="lbImg" alt=""></div>
+    <div class="lb-info">
+      <p class="lb-name" id="lbName"></p>
+      <p class="lb-path" id="lbPath"></p>
+      <p class="lb-meta" id="lbMeta"></p>
+      <div class="lb-actions">
+        <button id="lbReveal">在资源管理器中打开</button>
+        <button id="lbCopy">复制路径</button>
+        <button id="lbSimilar">找相似</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<div class="modal" id="rescanModal" hidden>
+  <div class="m-backdrop" data-mclose></div>
+  <div class="m-card" role="dialog" aria-modal="true" aria-labelledby="rmTitle">
+    <h3 id="rmTitle">重新扫描 E 盘？</h3>
+    <p class="m-desc">
+      将对 <b>E:\</b> 做一次<b>只读遍历</b>，与索引库比对：
+      新增文件自动进入缩略图/向量队列，被移动或删除的文件标记为失效。
+      <span class="m-safe">不会修改 E 盘的任何文件和目录</span>，扫描期间搜索可正常使用。
+    </p>
+    <div class="m-est" id="rescanEst">
+      <span class="m-est-ico"></span>
+      <span id="rescanEstText">正在读取历史扫描数据…</span>
+    </div>
+    <div class="m-actions">
+      <button class="m-btn ghost" data-mclose>取消</button>
+      <button class="m-btn primary" id="rescanConfirm">开始扫描</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js?v=20261022"></script>
+</body>
+</html>

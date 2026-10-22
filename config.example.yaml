@@ -1,0 +1,57 @@
+# 素材库检索 · 配置样例
+# 复制成 config.yaml 后按需修改（config.yaml 不入库，避免把本机路径带进仓库）
+#
+# 所有字段都可以用环境变量覆盖，环境变量优先级更高：
+#   ASSET_LIB_SOURCE / ASSET_LIB_DATA / ASSET_LIB_MODEL_DIR
+#   ASSET_LIB_DEVICE / ASSET_LIB_HOST / ASSET_LIB_PORT / ASSET_LIB_CONFIG
+#
+# 路径写法：绝对路径最稳；也支持 ~ 和相对仓库根目录的相对路径
+
+# ===== 必填：素材根目录（只读，不会被写入）=====
+# Windows 盘符：
+#   source_root: "E:\\"
+#   source_root: "E:\\Design Assets"
+# macOS / Linux：
+#   source_root: "/Volumes/Design"
+#   source_root: "~/Pictures"
+source_root: ""
+
+# ===== 数据目录：索引 / 缩略图 / 向量 / 日志 / 临时文件 =====
+# 留空 = <仓库目录>/data
+# 建议单独放一块容量充足的盘，占用约「素材数量的 1.5 万分之一 × 单图大小」，
+# 实测 21 万素材（12.7TB）派生数据约 1.2GB（缩略图）+ 0.4GB（向量）+ 0.4GB（索引）
+data_root: ""
+
+# ===== 模型目录 =====
+# 留空 = <data_root>/models；本地权重放 <model_dir>/chinese-clip/
+model_dir: ""
+
+# 扫描时跳过的目录名（小写匹配）
+skip_dirs:
+  - "$recycle.bin"
+  - "system volume information"
+  - ".trashes"
+  - ".spotlight-v100"
+  - ".fseventsd"
+
+# ===== 缩略图 =====
+thumb_max_side: 448      # 最长边像素
+thumb_quality: 82        # WebP 质量
+thumb_workers: 8         # 并发解码线程，机械盘建议 4，SSD 可 8~12
+
+# ===== 向量模型 =====
+clip_model: "OFA-Sys/chinese-clip-vit-base-patch16"
+clip_batch: 64           # 显存不足时降到 32 / 16
+# auto / cuda / mps / cpu
+#   auto：CUDA > MPS(Apple Silicon) > CPU
+#   显式指定但当前机器不可用时自动降级
+clip_device: "auto"
+
+# ===== 服务 =====
+host: "127.0.0.1"
+port: 8765
+
+# ===== 调度 =====
+rescan_on_start: true     # 启动时增量对账（距上次成功扫描 <10 分钟会自动跳过）
+rescan_interval_min: 120
+encode_on_start: true     # 启动时续跑未完成的向量编码

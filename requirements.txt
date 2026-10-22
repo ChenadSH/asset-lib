@@ -1,0 +1,21 @@
+# 运行时依赖
+# 安装：pip install -r requirements.txt
+# 可选格式库缺失时会自动降级（该格式没有缩略图，但仍能被名称检索到）
+
+fastapi>=0.110
+uvicorn[standard]>=0.27
+pyyaml>=6.0
+numpy>=1.26
+pillow>=10.0
+
+# 模型推理
+# macOS(Apple Silicon) 用官方 pip wheel 即是 MPS/CPU 版；
+# Windows/Linux 需要 CUDA 时按 https://pytorch.org 的指引安装对应轮子。
+torch>=2.4
+transformers>=4.40
+
+# 可选：各格式缩略图支持
+psd-tools>=0.10        # PSD 结构解析（当前实现只用自带的 image resource 1036，留作后备）
+rawpy>=0.20            # DNG / ARW / CR2 / CR3 / NEF 等相机 RAW
+pillow-heif>=0.16      # HEIC / HEIF
+PyMuPDF>=1.24          # AI / EPS 的 PDF 兼容层，以及 PDF 首页渲染
