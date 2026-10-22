@@ -30,6 +30,17 @@ def _guess_year(rel: str) -> int | None:
     return int(m[0]) if m else None
 
 
+def _sid(v: int) -> int:
+    """把无符号 64 位文件标识转成 SQLite 能存的有符号 64 位整数。
+
+    Windows（NTFS）的 st_dev / st_ino 来自文件索引号，可能是 2^63 以上，
+    直接入库会抛 "Python int too large to convert to SQLite INTEGER"。
+    统一在入库前做一次双射转换，读出来做键比较时两边都是同一表示。
+    """
+    v &= (1 << 64) - 1
+    return v - (1 << 64) if v >= (1 << 63) else v
+
+
 def _iter_files(root: str, skip: set[str]) -> "list[tuple]":
     """用 scandir 递归，DirEntry.stat() 在 Windows 上直接取目录枚举缓存，比 os.stat 快。"""
     out: list[tuple] = []
@@ -52,7 +63,9 @@ def _iter_files(root: str, skip: set[str]) -> "list[tuple]":
                         st = e.stat(follow_symlinks=False)
                         if not st.st_ino:
                             st = os.stat(e.path, follow_symlinks=False)
-                        out.append((st.st_dev, st.st_ino, e.path, e.name.lower(),
+                        # Windows 的 st_dev / st_ino 是无符号 64 位（NTFS 文件索引号可能 > 2^63），
+                        # 直接写库会溢出 SQLite 的有符号 INTEGER；统一转成有符号表示。
+                        out.append((_sid(st.st_dev), _sid(st.st_ino), e.path, e.name.lower(),
                                     os.path.splitext(e.name)[1].lower(), st.st_size, int(st.st_mtime)))
                 except (PermissionError, FileNotFoundError, OSError):
                     continue
@@ -124,7 +137,7 @@ def scan(cfg: Config | None = None, progress: Callable[[str], None] | None = Non
         log.warning(msg)
         return {"ok": False, "reason": "offline", "message": msg}
 
-    root_dev = os.stat(root).st_dev
+    root_dev = _sid(os.stat(root).st_dev)
 
     con = connect()
     try:

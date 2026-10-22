@@ -66,6 +66,8 @@ Python 3.6+ 在 Windows 上默认已启用长路径感知，但部分第三方�
 | 大小写敏感性 | macOS 默认不敏感、Linux 敏感 | 名称搜索是 `LIKE`/FTS 匹配，不做路径去重，一般无感 |
 | Unicode 规范化 | macOS 可能以 NFD 存储文件名 | CJK 不受影响；带音标的西文（é → e+́）搜索可能漏，必要时用 `unicodedata.normalize` 归一 |
 | inode 稳定性 | ext4 / APFS / NTFS 稳定；部分网络盘（SMB/NFS）不稳定 | 网络盘上改名/重挂载会导致缩略图重新生成 |
+| Windows inode 无符号 64 位 | NTFS 文件索引号可能 > 2^63，直接写 SQLite 会溢出 | 扫描入库前统一做无符号→有符号转换（`_sid`），缩略图 key 与库内表示保持一致 |
+| macOS/Linux inode 有符号 | 与 SQLite 范围天然兼容 | `_sid` 转换为恒等操作，无影响 |
 | 硬链接/软链接 | 硬链接共用 inode（会去重）；软链接按目标文件处理 | 符合预期 |
 
 ## 4. 平台特有的行为

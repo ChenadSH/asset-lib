@@ -31,7 +31,8 @@ _worker: ThumbWorker | None = None
 _scan_lock = threading.Lock()
 _scan_state: dict = {"running": False, "started_at": None, "last": None, "last_at": None, "last_error": None}
 
-KEY_RE = re.compile(r"^\d+_\d+$")
+# 文件名规则 <dev>_<ino>.webp；在 Windows 上这两个值可能是负号开头的有符号 64 位
+KEY_RE = re.compile(r"^-?\d+_-?\d+$")
 MAX_UPLOAD = 300 * 1024 * 1024
 PLACEHOLDER = (b"RIFF\x24\x00\x00\x00WEBPVP8L\x18\x00\x00\x00/\x00\x00\x00\x10\x07\x10\x11\x11\x88\x88\xfe\x07\x00")
 
