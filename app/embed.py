@@ -135,24 +135,53 @@ class VectorStore:
 
     @property
     def capacity(self) -> int:
+        self._ensure_loaded()
         return 0 if self.mat is None else self.mat.shape[0]
 
+    def _ensure_loaded(self) -> None:
+        """memmap 映射意外丢失时自动重开，避免一次扩容失败永久废掉查询。"""
+        if getattr(self, "mat", None) is None and self.path.exists():
+            log.warning("向量库映射丢失，重新打开 %s", self.path.name)
+            self.mat = np.load(self.path, mmap_mode="r+")
+            if self.count > self.mat.shape[0]:
+                self.count = self.mat.shape[0]
+
     def _grow(self, need: int) -> None:
+        self._ensure_loaded()
         assert self.mat is not None
-        new_cap = max(need, int(self.mat.shape[0] * 1.5))
-        log.info("向量库扩容 %d → %d", self.mat.shape[0], new_cap)
+        old_cap = int(self.mat.shape[0])
+        new_cap = max(need, int(old_cap * 1.5))
+        log.info("向量库扩容 %d → %d", old_cap, new_cap)
         tmp = self.path.with_suffix(".tmp.npy")
+        # 先写临时文件并释放其句柄，再替换正式文件；替换前不丢旧映射，
+        # 任何一步失败都能恢复原状，绝不让 self.mat 悬空。
         new = np.lib.format.open_memmap(tmp, mode="w+", dtype=np.float32, shape=(new_cap, self.dim))
-        new[: self.mat.shape[0]] = self.mat[:]
-        new.flush()
-        del self.mat
-        os.replace(tmp, self.path)
-        self.mat = np.load(self.path, mmap_mode="r+")
+        try:
+            new[:old_cap] = self.mat[:]
+            new.flush()
+        finally:
+            del new                                    # 释放 tmp 句柄，Windows 才能 replace
+        self.mat = None                                # 释放旧映射句柄，允许原子替换
+        try:
+            os.replace(tmp, self.path)
+            self.mat = np.load(self.path, mmap_mode="r+")
+        except BaseException:
+            log.exception("向量库扩容失败，尝试恢复旧映射")
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                self.mat = np.load(self.path, mmap_mode="r+")
+            except BaseException:
+                self.mat = None
+            raise
         ids = np.zeros(new_cap, dtype=np.int64)
         ids[: self.ids.shape[0]] = self.ids
         self.ids = ids
 
     def append(self, vecs: np.ndarray) -> int:
+        self._ensure_loaded()
         assert self.mat is not None
         n = vecs.shape[0]
         start = self.count
@@ -163,6 +192,7 @@ class VectorStore:
         return start
 
     def flush(self) -> None:
+        self._ensure_loaded()
         if self.mat is not None:
             self.mat.flush()
 
@@ -190,7 +220,8 @@ class VectorStore:
         return True
 
     def normalize_and_search(self, q: np.ndarray, topk: int = 200) -> tuple[np.ndarray, np.ndarray]:
-        if self.count == 0:
+        self._ensure_loaded()
+        if self.count == 0 or self.mat is None:
             return np.zeros(0), np.zeros(0, dtype=np.int64)
         m = np.asarray(self.mat[: self.count])
         q = q.astype(np.float32).reshape(-1)
