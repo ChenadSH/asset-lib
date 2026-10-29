@@ -173,12 +173,31 @@ mark{background:#fff2b8;color:inherit;border-radius:2px;padding:0 1px}
 }
 .lb-imgwrap{flex:1 1 62%; background:#1b2027; display:flex; align-items:center; justify-content:center; min-height:320px}
 .lb-imgwrap img{max-width:100%;max-height:80vh;object-fit:contain;display:block}
-.lb-info{flex:0 0 300px; padding:22px 22px 20px; display:flex; flex-direction:column; gap:8px}
+.lb-info{flex:0 0 340px; padding:22px 22px 20px; display:flex; flex-direction:column; gap:8px;
+  overflow-y:auto; max-height:80vh}
 .lb-name{margin:0;font-size:14px;font-weight:640;line-height:1.45;word-break:break-all}
 .lb-path{margin:0;font-size:11.5px;color:var(--ink3);line-height:1.6;word-break:break-all;
   max-height:120px;overflow:auto;font-family:"SFMono-Regular",Consolas,monospace}
 .lb-meta{margin:0;font-size:11.5px;color:var(--ink3)}
-.lb-actions{margin-top:auto;display:flex;flex-direction:column;gap:7px}
+
+/* ---------- 灯箱 · MLDNA 台账信息 ---------- */
+.lb-mldna{display:flex;flex-direction:column;gap:9px;padding-top:10px;
+  border-top:1px solid var(--line)}
+.lb-mldna[hidden]{display:none}
+.ml-title{font-size:13px;font-weight:600;color:var(--ink);line-height:1.5;word-break:break-word}
+.ml-crumbs{font-size:11.5px;color:var(--teal);font-weight:560;letter-spacing:.02em}
+.ml-desc{font-size:11.5px;color:var(--ink2);line-height:1.65;white-space:pre-wrap;word-break:break-word}
+.ml-kv{display:flex;flex-direction:column;gap:0;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.ml-row{display:flex;gap:10px;padding:5px 10px;font-size:11.5px;line-height:1.5}
+.ml-row+.ml-row{border-top:1px solid var(--line)}
+.ml-row .k{flex:0 0 84px;color:var(--ink3)}
+.ml-row .v{flex:1;color:var(--ink);word-break:break-word;min-width:0}
+.ml-links{display:flex;flex-direction:column;gap:6px}
+.ml-link{font-size:12px;color:var(--teal);text-decoration:none;word-break:break-all;
+  padding:7px 10px;border:1px solid var(--line);border-radius:8px;transition:.13s}
+.ml-link:hover{border-color:var(--teal);background:var(--teal-soft)}
+.ml-note{font-size:10.5px;color:var(--ink3);line-height:1.5}
+.lb-actions{margin-top:auto;display:flex;flex-direction:column;gap:7px;padding-top:10px}
 .lb-actions button{
   border:1px solid var(--line);background:#fff;border-radius:8px;padding:8px 12px;
   font:inherit;font-size:12.5px;color:var(--ink2);cursor:pointer;transition:.13s;text-align:left;

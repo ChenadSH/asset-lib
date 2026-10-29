@@ -243,6 +243,8 @@ function placeholder(it) {
 
 /* ---------------- 灯箱 ---------------- */
 let current = null;
+let mldnaSeq = 0;          // 防止快速切换卡片时旧响应写入新面板
+
 function openLightbox(it) {
   current = it;
   $('#lbName').textContent = it.name;
@@ -251,11 +253,60 @@ function openLightbox(it) {
     (it.ext || '').toUpperCase(), fmtSize(it.size), fmtDate(it.mtime),
     it.year ? it.year + ' 年' : '', it.top || ''
   ].filter(Boolean).join(' · ');
+  const box = $('#lbMldna');
+  box.hidden = true;
+  box.innerHTML = '';
   const img = $('#lbImg');
   img.src = it.thumb || '';
   img.style.display = it.thumb ? 'block' : 'none';
   $('#lightbox').hidden = false;
+  loadMldna(it.id);
 }
+
+/* 拉取台账详情（36 项业务字段 + 源站链接），仅在配置了 meta_db 时有内容 */
+async function loadMldna(fid) {
+  const mySeq = ++mldnaSeq;
+  try {
+    const d = await (await apiFetch('/api/file/' + fid, 10000)).json();
+    if (mySeq !== mldnaSeq || !d.mldna) return;
+    renderMldna(d.mldna);
+  } catch { /* 台账只是增强信息，失败不弹错误 */ }
+}
+
+function mldnaLink(href, label, title) {
+  return `<a class="ml-link" href="${esc(href)}" target="_blank" rel="noopener" title="${esc(title || href)}">${esc(label)}</a>`;
+}
+
+function renderMldna(m) {
+  const box = $('#lbMldna');
+  const rows = [];
+  if (m.title && m.title !== current?.name.replace(/\.[^.]+$/, '')) {
+    rows.push(`<div class="ml-title">${esc(m.title)}</div>`);
+  }
+  if (m.brand || m.campaign) {
+    rows.push(`<div class="ml-crumbs">${esc([m.brand, m.campaign].filter(Boolean).join(' / '))}</div>`);
+  }
+  if (m.description) {
+    rows.push(`<div class="ml-desc">${esc(m.description)}</div>`);
+  }
+  const kv = (m.fields || []).map(([k, v]) =>
+    `<div class="ml-row"><span class="k">${esc(k)}</span><span class="v">${esc(v)}</span></div>`).join('');
+  if (kv) rows.push(`<div class="ml-kv">${kv}</div>`);
+
+  const links = [];
+  if (m.detail_url) links.push(mldnaLink(m.detail_url, '↗ 源站详情页'));
+  if (m.origin_url) links.push(mldnaLink(m.origin_url, '↗ 原始文件下载'));
+  (m.source_pages || []).forEach((p, i) =>
+    links.push(mldnaLink(p, `↗ 出现页面${m.source_pages.length > 1 ? ' ' + (i + 1) : ''}`)));
+  if (links.length) {
+    rows.push(`<div class="ml-links">${links.join('')}</div>`);
+    rows.push(`<div class="ml-note">商用使用请以源站 Rights / Licence 字段为准</div>`);
+  }
+  if (!rows.length) return;
+  box.innerHTML = rows.join('');
+  box.hidden = false;
+}
+
 function closeLightbox() { $('#lightbox').hidden = true; current = null; }
 
 /* ---------------- 以图搜图 ---------------- */

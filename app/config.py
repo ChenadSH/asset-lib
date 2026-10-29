@@ -99,6 +99,9 @@ class Config:
     data_root: str = ""
     # 模型目录。留空 -> <data_root>/models
     model_dir: str = ""
+    # 外挂元数据库（可选）：SQLite，assets 表按 lib_path 相对路径关联素材文件。
+    # 配置后 /api/file/{id} 会附带 mldna 字段与源站链接（如 MLDNA 台账）
+    meta_db: str = ""
 
     skip_dirs: list[str] = field(default_factory=lambda: [
         "$recycle.bin", "system volume information", ".trashes", ".spotlight-v100", ".fseventsd",
@@ -120,6 +123,7 @@ class Config:
         self.source_root = _abspath(self.source_root)
         self.data_root = _abspath(self.data_root) or str(BASE_DIR / "data")
         self.model_dir = _abspath(self.model_dir) or str(Path(self.data_root) / "models")
+        self.meta_db = _abspath(self.meta_db)
 
     # ---------- 派生路径 ----------
     @property

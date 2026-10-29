@@ -197,6 +197,12 @@ def api_file(fid: int):
     d = S.get_file(fid)
     if not d:
         raise HTTPException(404, "not found")
+    try:
+        from . import mlmeta
+        d["mldna"] = mlmeta.by_path(d["path"])
+    except Exception:  # noqa: BLE001  台账异常不影响基础详情
+        log.exception("台账回查失败")
+        d["mldna"] = None
     return d
 
 
