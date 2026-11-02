@@ -19,10 +19,14 @@ from concurrent.futures import ThreadPoolExecutor
 from .config import CFG, Config
 from .db import connect
 from .extract import (VIDEO_SKIP, cleanup_video_frames, extract,
-                      extract_video_frames, ffmpeg_bin, phash,
+                      extract_video_frames, ffmpeg_bin, grab_frame, phash,
                       plan_video_frames, save_thumb, video_duration)
 
 log = logging.getLogger("worker")
+
+# 超过这个体积的视频先抽一帧封面落库，再补副帧（实测 500MB+ 的多是
+# 4K ProRes 母版，整段抽完要几十秒，先出图体验好得多）
+COVER_FIRST_SIZE = 500 * 1024 * 1024
 
 # 分轮次处理：TIFF 单张几百 MB，放最后，避免拖慢首屏可用时间；
 # 视频抽帧最慢（每帧一次 seek 解码），排最末，不挤占图片的首屏时间。
@@ -128,6 +132,16 @@ class ThumbWorker:
         if fc > n:
             cleanup_video_frames(base, keep=n)
 
+        # 大文件先抽第一帧并立刻落库：整段抽完要几十秒，先让列表里有图，
+        # 用户不必盯着占位图等。副帧随后补，失败也不影响已有封面。
+        big = (row["size"] or 0) > COVER_FIRST_SIZE
+        if big and n > 1 and not os.path.exists(dest):
+            t0 = min(dur * 0.5 / n, max(0.0, dur * 0.995))
+            im0 = grab_frame(row["path"], t0, self.cfg.thumb_max_side)
+            if im0 is not None and save_thumb(im0, dest, self.cfg.thumb_max_side,
+                                             self.cfg.thumb_quality):
+                self._mark_ready(fid, dest)
+
         saved = extract_video_frames(row["path"], base, n,
                                      self.cfg.thumb_max_side,
                                      self.cfg.thumb_quality,
@@ -141,6 +155,35 @@ class ThumbWorker:
         except Exception:  # noqa: BLE001
             pass
         return (row["qid"], fid, 1, ph, None, {"frame_count": saved})
+
+    def _mark_ready(self, fid: int, dest: str) -> None:
+        """把单个视频提前标成「有缩略图」，不等整批写库。
+
+        worker 是 240 个一批才统一写库的，大文件一批能跑十几分钟；
+        封面已经落盘了就先落库，前端刷新即可见。向量由 embed 跟进补。
+        """
+        ph = None
+        try:
+            from PIL import Image
+            ph = phash(Image.open(dest))
+        except Exception:  # noqa: BLE001
+            pass
+        for _ in range(3):
+            con = None
+            try:
+                con = connect()
+                con.execute("UPDATE files SET thumb=1, phash=? WHERE id=?", (ph, fid))
+                con.commit()
+                return
+            except sqlite3.OperationalError:
+                time.sleep(0.3)
+            finally:
+                if con is not None:
+                    try:
+                        con.close()
+                    except Exception:
+                        pass
+
 
     def _write(self, results: list) -> bool:
         ok_ids = [r[1] for r in results if r[2] == 1]
