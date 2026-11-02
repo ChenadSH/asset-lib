@@ -229,6 +229,7 @@ function renderCard(it) {
     tw.appendChild(placeholder(it));
   }
   if (it.same_source) card.appendChild(el('div', 'badge src', '同源'));
+  if (it.kind === 'video' && it.frames) card.appendChild(el('div', 'badge frames', it.frames + ' 帧'));
   card.appendChild(tw);
 
   const cap = el('div', 'cap');
@@ -261,8 +262,10 @@ function openLightbox(it) {
   $('#lbPath').textContent = it.path;
   $('#lbMeta').textContent = [
     (it.ext || '').toUpperCase(), fmtSize(it.size), fmtDate(it.mtime),
-    it.year ? it.year + ' 年' : '', it.top || ''
+    it.year ? it.year + ' 年' : '', it.top || '',
+    it.kind === 'video' && it.frames ? `已抽 ${it.frames} 帧` : ''
   ].filter(Boolean).join(' · ');
+  renderFrameStrip(it);
   const box = $('#lbMldna');
   box.hidden = true;
   box.innerHTML = '';
@@ -271,6 +274,64 @@ function openLightbox(it) {
   img.style.display = it.thumb ? 'block' : 'none';
   $('#lightbox').hidden = false;
   loadMldna(it.id);
+}
+
+/* 视频帧条：点任一帧换主图，双击帧直接以该帧找相似 */
+function renderFrameStrip(it) {
+  const box = $('#lbFrames');
+  box.innerHTML = '';
+  if (it.kind !== 'video' || !it.frames || !it.thumb) { box.hidden = true; return; }
+  const key = it.thumb.replace('/thumb/', '');
+  const label = el('div', 'fr-label', `${it.frames} 个画面帧`);
+  box.appendChild(label);
+  const row = el('div', 'fr-row');
+  for (let i = 0; i < it.frames; i++) {
+    const k = i === 0 ? key : `${key}_f${i}`;
+    const img = el('img');
+    img.loading = 'lazy';
+    img.src = `/thumb/${k}`;
+    img.title = `第 ${i + 1} 帧`;
+    img.onclick = () => { $('#lbImg').src = img.src; };
+    img.ondblclick = () => searchByFrame(it.id, i, img.src);
+    row.appendChild(img);
+  }
+  box.appendChild(row);
+  box.hidden = false;
+}
+
+/* 以视频某一帧找相似：与「找相似」同一套展示流程，查询图换成该帧 */
+async function searchByFrame(fid, frameIdx, thumbSrc) {
+  closeLightbox();
+  state.seq++;
+  state.imageSearching = true;
+  state.mode = 'image';
+  setMode('image');
+
+  if (queryURL) { URL.revokeObjectURL(queryURL); queryURL = null; }
+  const img = $('#qthumbImg');
+  if (thumbSrc) { img.src = thumbSrc; img.title = '视频第 ' + (frameIdx + 1) + ' 帧'; }
+  $('#qthumb').hidden = !thumbSrc;
+  $('#qthumb').classList.add('busy');
+  $('#qimgClear').hidden = false;
+  $('#q').value = '';
+  $('#q').placeholder = '视频第 ' + (frameIdx + 1) + ' 帧';
+
+  $('#grid').innerHTML = '';
+  $('#empty').hidden = true;
+  setProgress(25, '按帧找相似…');
+  const t0 = performance.now();
+  try {
+    const r = await fetch(`/api/similar/${fid}/frame/${frameIdx}?limit=60`);
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || '服务返回 ' + r.status);
+    const d = await r.json();
+    setProgress(88, '整理结果…');
+    renderImageResult(d, performance.now() - t0);
+  } catch (e) {
+    failProgress('失败');
+    $('#metaLine').innerHTML = `<span class="cov">按帧找相似失败：${esc(e.message)}</span>`;
+  } finally {
+    state.imageSearching = false;
+  }
 }
 
 /* 拉取台账详情（36 项业务字段 + 源站链接），仅在配置了 meta_db 时有内容 */

@@ -136,7 +136,18 @@ main{padding:16px 20px 60px}
   background:rgba(13,125,138,.92); color:#fff; padding:2px 6px; border-radius:4px;
 }
 .badge.src{background:rgba(184,116,26,.92)}
+.badge.frames{left:auto;right:6px;background:rgba(20,90,110,.92)}
 mark{background:#fff2b8;color:inherit;border-radius:2px;padding:0 1px}
+
+/* 视频帧条（灯箱内） */
+.lb-frames{margin-top:12px}
+.lb-frames .fr-label{font-size:11px;color:var(--ink3);margin-bottom:6px}
+.lb-frames .fr-row{display:flex;flex-wrap:wrap;gap:6px;max-height:150px;overflow:auto}
+.lb-frames .fr-row img{
+  height:64px;border-radius:6px;cursor:pointer;border:2px solid transparent;
+  transition:.12s;background:#f0f2f4;
+}
+.lb-frames .fr-row img:hover{border-color:var(--teal);transform:translateY(-1px)}
 
 .empty{text-align:center;padding:90px 20px;color:var(--ink3)}
 .empty .et{font-size:15px;color:var(--ink2);margin:0 0 6px}

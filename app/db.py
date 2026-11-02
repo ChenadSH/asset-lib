@@ -26,6 +26,10 @@ CREATE TABLE IF NOT EXISTS files (
   vec_row  INTEGER,
   phash    INTEGER,
   seen_at  INTEGER,
+  -- 视频抽帧：frame_count = 已抽帧数（f0 代表帧 + f1.. 副帧），
+  -- frames_done = 已编码向量的帧数（断点续跑指针）
+  frame_count INTEGER DEFAULT 0,
+  frames_done INTEGER DEFAULT 0,
   UNIQUE(dev, ino)
 );
 CREATE INDEX IF NOT EXISTS idx_kind   ON files(kind);
@@ -59,6 +63,14 @@ CREATE TABLE IF NOT EXISTS meta (
   k TEXT PRIMARY KEY,
   v TEXT
 );
+
+-- 视频帧的向量映射：一个视频多帧多向量，全部指向同一 file_id
+CREATE TABLE IF NOT EXISTS video_vec_map (
+  file_id INTEGER NOT NULL,
+  vec_row INTEGER NOT NULL,
+  UNIQUE(file_id, vec_row)
+);
+CREATE INDEX IF NOT EXISTS idx_vvm_row ON video_vec_map(vec_row);
 """
 
 # FTS 触发器：保持与 files 同步
@@ -95,6 +107,12 @@ def init_db(path: Path | None = None) -> None:
     try:
         con.executescript(SCHEMA)
         con.executescript(TRIGGERS)
+        # 已有库的列迁移：SQLite 的 ALTER 只支持加列，够用
+        cols = {r[1] for r in con.execute("PRAGMA table_info(files)")}
+        if "frame_count" not in cols:
+            con.execute("ALTER TABLE files ADD COLUMN frame_count INTEGER DEFAULT 0")
+        if "frames_done" not in cols:
+            con.execute("ALTER TABLE files ADD COLUMN frames_done INTEGER DEFAULT 0")
         con.commit()
     finally:
         con.close()

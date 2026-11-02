@@ -111,6 +111,11 @@ class Config:
     thumb_max_side: int = 448
     thumb_quality: int = 82
     thumb_workers: int = 8
+    # 视频抽帧策略：每个视频按「时长 × per_minute」抽帧，上下限截断。
+    # 例：per_minute=5, min=5, max=50 → 1 分钟 5 帧、5 分钟 25 帧、10 分钟及以上 50 帧
+    video_frames: dict = field(default_factory=lambda: {"per_minute": 5, "min": 5, "max": 50})
+    # ffmpeg 可执行文件路径；留空自动从 PATH 与 ffmpeg 同目录探测
+    ffmpeg_path: str = ""
     clip_model: str = "OFA-Sys/chinese-clip-vit-base-patch16"
     clip_batch: int = 64
     # auto / cuda / mps / cpu；auto 会自动挑选当前机器可用的最快设备
@@ -126,6 +131,15 @@ class Config:
         self.data_root = _abspath(self.data_root) or str(BASE_DIR / "data")
         self.model_dir = _abspath(self.model_dir) or str(Path(self.data_root) / "models")
         self.meta_db = _abspath(self.meta_db)
+        # 视频抽帧策略归一化：非法值回退默认，保证 workers 拿到的一定是三个 int
+        vf = self.video_frames if isinstance(self.video_frames, dict) else {}
+        try:
+            per_minute = max(1, int(vf.get("per_minute", 5)))
+            vmin = max(1, int(vf.get("min", 5)))
+            vmax = max(vmin, int(vf.get("max", 50)))
+        except (TypeError, ValueError):
+            per_minute, vmin, vmax = 5, 5, 50
+        self.video_frames = {"per_minute": per_minute, "min": vmin, "max": vmax}
 
     # ---------- 派生路径 ----------
     @property
@@ -240,7 +254,16 @@ def setup_logging(cfg: Config | None = None) -> None:
         return
     root.setLevel(logging.INFO)
 
-    fh = TimedRotatingFileHandler(c.log_dir / "app.log", when="midnight", backupCount=30, encoding="utf-8")
+    # 同一台机器可能跑多个实例（主服务 / 内嵌 worker 的其他服务 / CLI 工具），
+    # app.log 被其他实例握住时绝不能让进程起不来：退回带实例名的日志文件
+    try:
+        fh = TimedRotatingFileHandler(c.log_dir / "app.log", when="midnight",
+                                      backupCount=30, encoding="utf-8")
+    except PermissionError:
+        alt = c.log_dir / f"app.{os.getpid()}.log"
+        logging.getLogger(__name__).warning(
+            "app.log 被其他实例占用，日志改写到 %s", alt.name)
+        fh = TimedRotatingFileHandler(alt, when="midnight", backupCount=7, encoding="utf-8")
     fh.setFormatter(fmt)
     root.addHandler(fh)
 

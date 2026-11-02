@@ -132,6 +132,13 @@ class VectorStore:
         for r in rows:
             if 0 <= r["vec_row"] < cap:
                 self.ids[r["vec_row"]] = r["id"]
+        # 视频多帧向量：所有帧的 vec_row 都映射回同一 file_id
+        try:
+            for r in con.execute("SELECT vec_row, file_id FROM video_vec_map"):
+                if 0 <= r["vec_row"] < cap:
+                    self.ids[r["vec_row"]] = r["file_id"]
+        except Exception:
+            pass
 
     @property
     def capacity(self) -> int:
@@ -212,6 +219,13 @@ class VectorStore:
             rows = con.execute(
                 "SELECT vec_row, id FROM files WHERE vec_row >= ? AND vec_row < ?",
                 (self.count, cur)).fetchall()
+            # 视频多帧向量同样增量补映射
+            try:
+                rows += con.execute(
+                    "SELECT vec_row, file_id AS id FROM video_vec_map "
+                    "WHERE vec_row >= ? AND vec_row < ?", (self.count, cur)).fetchall()
+            except Exception:
+                pass
         finally:
             con.close()
         for r in rows:
@@ -295,47 +309,40 @@ def encode_pending(batch: int | None = None, progress=None) -> dict:
         while True:
             rows = con.execute(
                 "SELECT id, dev, ino FROM files "
-                "WHERE vec_row IS NULL AND thumb=1 AND status='ready' "
+                "WHERE vec_row IS NULL AND thumb=1 AND status='ready' AND kind<>'video' "
                 "ORDER BY id LIMIT ?", (bs,)
             ).fetchall()
-            if not rows:
-                break
-            imgs, keep = [], []
-            for r in rows:
-                p = CFG.thumb_dir / f"{r['dev']}_{r['ino']}.webp"
-                if not p.exists():
-                    failed += 1
-                    con.execute("UPDATE files SET thumb=0 WHERE id=?", (r["id"],))
-                    continue
-                try:
-                    im = Image.open(p).convert("RGB")
-                    imgs.append(im)
-                    keep.append(r["id"])
-                except Exception:
-                    failed += 1
-                    con.execute("UPDATE files SET thumb=2 WHERE id=?", (r["id"],))
-            if not imgs:
-                con.commit()
+            if rows:
+                n, f = _encode_files(con, st, model, proc, dev, rows, bs, say)
+                total += n
+                failed += f
+                if total % (bs * 10) < bs:
+                    say(f"编码进度：{total} 张")
                 continue
 
-            inputs = proc(images=imgs, return_tensors="pt")
-            inputs = {k: v.to(dev) for k, v in inputs.items()}
-            with torch.no_grad():
-                out = _feat(model.get_image_features(**inputs))
-            out = out / out.norm(dim=-1, keepdim=True)
-            vecs = out.detach().float().cpu().numpy()
-
-            start = st.append(vecs)
-            con.executemany("UPDATE files SET vec_row=? WHERE id=?",
-                            [(start + i, fid) for i, fid in enumerate(keep)])
-            # 每批都同步 meta：这样服务端能实时看到「已就绪」，不必等全量跑完
-            set_meta(con, "vec_count", str(st.count))
-            set_meta(con, "vec_dim", str(_DIM))
-            con.commit()
-
-            total += len(keep)
-            if total % (bs * 10) < bs:
-                say(f"编码进度：{total} 张")
+            # 视频多帧：每个视频把未编码的帧全部编码，向量都映射到同一 file_id
+            vrows = con.execute(
+                "SELECT id, dev, ino, frame_count, frames_done FROM files "
+                "WHERE kind='video' AND thumb=1 AND status='ready' "
+                "AND frames_done < frame_count ORDER BY id LIMIT ?", (bs,)
+            ).fetchall()
+            if not vrows:
+                # 视频帧是 worker 后台慢慢抽的：还有队列任务就等待跟进，别急着退出
+                pending = con.execute(
+                    "SELECT count(*) c FROM queue WHERE job='thumb'").fetchone()["c"]
+                if pending:
+                    say(f"缩略图队列还有 {pending} 个任务，30 秒后继续跟进编码")
+                    con.commit()
+                    time.sleep(30)
+                    continue
+                break
+            for r in vrows:
+                try:
+                    n = _encode_video_frames(con, st, model, proc, dev, r, say)
+                    total += n
+                except Exception as ex:  # noqa: BLE001
+                    failed += 1
+                    log.warning("视频帧编码失败 id=%s：%s", r["id"], ex)
     finally:
         st.flush()
         con.execute("INSERT INTO meta(k,v) VALUES('vec_count',?) "
@@ -347,6 +354,89 @@ def encode_pending(batch: int | None = None, progress=None) -> dict:
 
     say(f"编码完成：新增 {total}，失败 {failed}，库内共 {st.count}")
     return {"encoded": total, "failed": failed, "total": st.count}
+
+
+def _encode_files(con, st, model, proc, dev, rows, bs, say) -> tuple[int, int]:
+    """普通单图文件批量编码。返回 (成功数, 失败数)。"""
+    import torch
+    from PIL import Image
+    failed = 0
+    imgs, keep = [], []
+    for r in rows:
+        p = CFG.thumb_dir / f"{r['dev']}_{r['ino']}.webp"
+        if not p.exists():
+            con.execute("UPDATE files SET thumb=0 WHERE id=?", (r["id"],))
+            failed += 1
+            continue
+        try:
+            imgs.append(Image.open(p).convert("RGB"))
+            keep.append(r["id"])
+        except Exception:
+            con.execute("UPDATE files SET thumb=2 WHERE id=?", (r["id"],))
+            failed += 1
+    if not imgs:
+        con.commit()
+        return 0, failed
+
+    inputs = proc(images=imgs, return_tensors="pt")
+    inputs = {k: v.to(dev) for k, v in inputs.items()}
+    with torch.no_grad():
+        out = _feat(model.get_image_features(**inputs))
+    out = out / out.norm(dim=-1, keepdim=True)
+    vecs = out.detach().float().cpu().numpy()
+
+    start = st.append(vecs)
+    con.executemany("UPDATE files SET vec_row=? WHERE id=?",
+                    [(start + i, fid) for i, fid in enumerate(keep)])
+    # 每批都同步 meta：这样服务端能实时看到「已就绪」，不必等全量跑完
+    set_meta(con, "vec_count", str(st.count))
+    set_meta(con, "vec_dim", str(_DIM))
+    con.commit()
+    return len(keep), failed
+
+
+def _encode_video_frames(con, st, model, proc, dev, r, say) -> int:
+    """编码一个视频尚未编码的帧（断点续跑：frames_done 指针）。
+
+    帧命名：f0 = <dev>_<ino>.webp，f1.. = <dev>_<ino>_f<i>.webp。
+    所有帧向量都写入 video_vec_map，映射回同一 file_id。
+    返回本视频新增编码的帧数。
+    """
+    import torch
+    from PIL import Image
+
+    fid, done, total_n = r["id"], int(r["frames_done"] or 0), int(r["frame_count"] or 0)
+    if total_n <= done:
+        return 0
+    base = str(CFG.thumb_dir / f"{r['dev']}_{r['ino']}")
+    paths = []
+    for i in range(done, total_n):
+        p = f"{base}.webp" if i == 0 else f"{base}_f{i}.webp"
+        if os.path.exists(p):
+            paths.append((i, p))
+    if not paths:
+        return 0
+
+    vecs_all = []
+    for chunk_start in range(0, len(paths), CFG.clip_batch):
+        chunk = paths[chunk_start:chunk_start + CFG.clip_batch]
+        imgs = [Image.open(p).convert("RGB") for _, p in chunk]
+        inputs = proc(images=imgs, return_tensors="pt")
+        inputs = {k: v.to(dev) for k, v in inputs.items()}
+        with torch.no_grad():
+            out = _feat(model.get_image_features(**inputs))
+        out = out / out.norm(dim=-1, keepdim=True)
+        vecs_all.append(out.detach().float().cpu().numpy())
+    vecs = np.concatenate(vecs_all)
+
+    start = st.append(vecs)
+    con.executemany("INSERT OR IGNORE INTO video_vec_map(file_id, vec_row) VALUES(?,?)",
+                    [(fid, start + i) for i in range(len(paths))])
+    con.execute("UPDATE files SET vec_row=? WHERE id=? AND vec_row IS NULL", (start, fid))
+    con.execute("UPDATE files SET frames_done=? WHERE id=?", (done + len(paths), fid))
+    set_meta(con, "vec_count", str(st.count))
+    con.commit()
+    return len(paths)
 
 
 def _encode_image(im) -> np.ndarray:
@@ -482,6 +572,9 @@ def coverage() -> dict:
             "searchable": g("SELECT count(*) FROM files WHERE kind IN ('raster','design','raw','doc')"),
             "fingerprinted": g("SELECT count(*) FROM files WHERE phash IS NOT NULL"),
             "vectorized": g("SELECT count(*) FROM files WHERE vec_row IS NOT NULL"),
+            "videos": g("SELECT count(*) FROM files WHERE kind='video'"),
+            "video_framed": g("SELECT count(*) FROM files WHERE kind='video' AND frame_count>0"),
+            "video_frames": g("SELECT sum(frame_count) FROM files WHERE kind='video'"),
         }
     finally:
         con.close()
@@ -597,7 +690,8 @@ def _fetch_rows(ids) -> dict:
             ph = ",".join("?" * len(chunk))
             for r in con.execute(
                     "SELECT f.id, f.path, f.name, f.ext, f.kind, f.size, f.mtime, f.top,"
-                    " f.year, f.dev, f.ino, f.thumb, f.phash FROM files f WHERE f.id IN (" + ph + ")",
+                    " f.year, f.dev, f.ino, f.thumb, f.phash, f.frame_count FROM files f "
+                    "WHERE f.id IN (" + ph + ")",
                     chunk):
                 out[r["id"]] = r
         return out
@@ -618,6 +712,7 @@ def _item(r, score=None, dist=None) -> dict:
         "top": r["top"],
         "year": r["year"],
         "thumb": f"/thumb/{r['dev']}_{r['ino']}" if r["thumb"] == 1 else None,
+        "frames": int(r["frame_count"] or 0) if "frame_count" in r.keys() else 0,
         "score": None if score is None else round(float(score), 4),
         "dist": dist,
         "match": "fingerprint" if same else "vector",
@@ -646,7 +741,13 @@ def _assemble(qvec, limit: int, fp: list | None = None) -> dict:
     vec_items = []
     if qvec is not None:
         sims, ids = store().normalize_and_search(qvec, max(200, limit * 3))
-        pairs = [(int(i), float(s)) for i, s in zip(ids.tolist(), sims.tolist()) if int(i) not in seen]
+        # 一个视频有多个帧向量，去重后保留最高分，避免同一视频占满结果
+        best: dict[int, float] = {}
+        for i, s in zip(ids.tolist(), sims.tolist()):
+            fid = int(i)
+            if fid and fid not in seen and s > best.get(fid, -2.0):
+                best[fid] = s
+        pairs = sorted(best.items(), key=lambda kv: -kv[1])
         rows2 = _fetch_rows([fid for fid, _ in pairs])
         for fid, s in pairs:
             r = rows2.get(fid)
@@ -772,6 +873,35 @@ def search_by_file_id(fid: int, limit: int = 60) -> dict:
     if r["phash"] is not None:
         fp = [(d, i) for d, i in phash_index().search(r["phash"], limit=max(80, limit)) if i != fid]
     res = _assemble(qv, limit + 1, fp)
+    items = [x for x in res["items"] if x["id"] != fid][:limit]
+    return {"mode": "image", "total": len(items), "items": items,
+            "same_source": res["same_source"], "coverage": coverage(),
+            "took_ms": round((time.perf_counter() - t0) * 1000, 1)}
+
+
+def search_by_frame(fid: int, idx: int, limit: int = 60) -> dict:
+    """以视频第 idx 帧画面找相似。帧向量虽已入库但都映射回视频本身，
+    这里现场对指定帧编码一份向量，才能真正做到「按这一帧找」。"""
+    t0 = time.perf_counter()
+    con = connect(readonly=True)
+    try:
+        r = con.execute("SELECT phash, thumb, dev, ino, frame_count FROM files WHERE id=?",
+                        (fid,)).fetchone()
+    finally:
+        con.close()
+    if not r or not r["thumb"] or idx >= int(r["frame_count"] or 0):
+        return {"mode": "image", "total": 0, "items": [], "took_ms": 0}
+
+    base = CFG.thumb_dir / f"{r['dev']}_{r['ino']}"
+    p = base.with_suffix(".webp") if idx == 0 else Path(f"{base}_f{idx}.webp")
+    qv = None
+    try:
+        from PIL import Image
+        qv = _encode_image(Image.open(p))
+    except Exception as ex:  # noqa: BLE001
+        log.debug("帧现场编码失败 fid=%s f%d: %s", fid, idx, ex)
+
+    res = _assemble(qv, limit + 1)
     items = [x for x in res["items"] if x["id"] != fid][:limit]
     return {"mode": "image", "total": len(items), "items": items,
             "same_source": res["same_source"], "coverage": coverage(),

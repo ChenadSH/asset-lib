@@ -39,6 +39,18 @@ thumb_max_side: 448      # 最长边像素
 thumb_quality: 82        # WebP 质量
 thumb_workers: 8         # 并发解码线程，机械盘建议 4，SSD 可 8~12
 
+# ===== 视频抽帧 =====
+# 每个视频按「时长 × per_minute」均匀抽帧，帧数夹在 [min, max]：
+# 默认 1 分钟 5 帧、5 分钟 25 帧、10 分钟及以上 50 帧。
+# 视频抽帧很慢（每帧一次 seek 解码），放在缩略图队列最后处理；
+# 调大后想重新抽已有视频，删掉 thumbs 里对应 _f*.webp 再触发重扫即可。
+video_frames:
+  per_minute: 5
+  min: 5
+  max: 50
+# ffmpeg 路径；留空自动从 PATH 探测（ffprobe 需在同目录）
+# ffmpeg_path: "C:\\ffmpeg\\bin\\ffmpeg.exe"
+
 # ===== 向量模型 =====
 clip_model: "OFA-Sys/chinese-clip-vit-base-patch16"
 clip_batch: 64           # 显存不足时降到 32 / 16

@@ -31,8 +31,9 @@ _worker: ThumbWorker | None = None
 _scan_lock = threading.Lock()
 _scan_state: dict = {"running": False, "started_at": None, "last": None, "last_at": None, "last_error": None}
 
-# 文件名规则 <dev>_<ino>.webp；在 Windows 上这两个值可能是负号开头的有符号 64 位
-KEY_RE = re.compile(r"^-?\d+_-?\d+$")
+# 文件名规则 <dev>_<ino>.webp 或 <dev>_<ino>_f<i>.webp（视频副帧）；
+# 在 Windows 上这两个值可能是负号开头的有符号 64 位
+KEY_RE = re.compile(r"^-?\d+_-?\d+(?:_f\d+)?$")
 MAX_UPLOAD = 300 * 1024 * 1024
 PLACEHOLDER = (b"RIFF\x24\x00\x00\x00WEBPVP8L\x18\x00\x00\x00/\x00\x00\x00\x10\x07\x10\x11\x11\x88\x88\xfe\x07\x00")
 
@@ -320,6 +321,15 @@ async def api_similar(file: UploadFile = File(...), limit: int = 60):
 def api_similar_by_id(fid: int, limit: int = 60):
     from . import embed
     return embed.search_by_file_id(fid, limit)
+
+
+@app.get("/api/similar/{fid}/frame/{idx}")
+def api_similar_by_frame(fid: int, idx: int, limit: int = 60):
+    """以视频某一帧画面找相似。"""
+    from . import embed
+    if idx < 0 or idx > 200:
+        raise HTTPException(400, "帧序号越界")
+    return embed.search_by_frame(fid, idx, limit)
 
 
 @app.get("/api/text-search")

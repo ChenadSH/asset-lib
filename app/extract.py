@@ -263,3 +263,128 @@ def save_thumb(im: Image.Image, dest: str, max_side: int = 448, quality: int = 8
     except Exception as ex:
         log.debug("save_thumb failed: %s", ex)
         return False
+
+
+# ---------------- 视频抽帧 ----------------
+# 帧文件命名：代表帧 <dev>_<ino>.webp，其余 <dev>_<ino>_f<i>.webp（i 从 1 起）。
+# 代表帧沿用普通缩略图命名，前端 /thumb/<key> 无需区分类型。
+
+_ff_cache: dict = {}
+
+
+def ffmpeg_bin(cfg=None) -> str | None:
+    """定位 ffmpeg。优先配置项 ffmpeg_path，其次 PATH；结果缓存。"""
+    if "ffmpeg" in _ff_cache:
+        return _ff_cache["ffmpeg"]
+    import shutil
+    cand = None
+    cfg_path = getattr(cfg, "ffmpeg_path", "") if cfg else ""
+    if cfg_path and os.path.isfile(cfg_path):
+        cand = cfg_path
+    if not cand:
+        cand = shutil.which("ffmpeg")
+    _ff_cache["ffmpeg"] = cand
+    return cand
+
+
+def _ffprobe_bin() -> str | None:
+    if "ffprobe" in _ff_cache:
+        return _ff_cache["ffprobe"]
+    import shutil
+    cand = shutil.which("ffprobe")
+    if not cand:
+        ff = _ff_cache.get("ffmpeg")
+        if ff:
+            p = os.path.join(os.path.dirname(ff), "ffprobe" + (".exe" if os.name == "nt" else ""))
+            cand = p if os.path.isfile(p) else None
+    _ff_cache["ffprobe"] = cand
+    return cand
+
+
+def video_duration(path: str, timeout: int = 60) -> float | None:
+    """ffprobe 读容器时长（秒）。读不到返回 None（损坏 / 网络超时 / 无元数据）。"""
+    probe = _ffprobe_bin()
+    if not probe:
+        return None
+    import subprocess
+    try:
+        r = subprocess.run(
+            [probe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", path],
+            capture_output=True, timeout=timeout,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+        out = (r.stdout or b"").decode("utf-8", "ignore").strip().splitlines()
+        return float(out[0]) if out and out[0] not in ("N/A", "") else None
+    except Exception:
+        return None
+
+
+def plan_video_frames(duration: float | None, per_minute: int = 5,
+                      lo: int = 5, hi: int = 50) -> int:
+    """帧数策略：时长 × per_minute，夹在 [lo, hi]。
+
+    1 分钟 → 5 帧、5 分钟 → 25 帧、10 分钟及以上 → 50 帧（per_minute=5 时）。
+    """
+    if not duration or duration <= 0:
+        return lo
+    n = int(round(duration / 60.0 * per_minute))
+    return max(lo, min(hi, n))
+
+
+def grab_frame(path: str, t: float, max_side: int = 448, timeout: int = 120) -> Image.Image | None:
+    """取视频 t 秒处一帧，经 stdout 管道直读内存，全程不落盘。"""
+    ff = ffmpeg_bin()
+    if not ff:
+        return None
+    import subprocess
+    try:
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        r = subprocess.run(
+            [ff, "-hide_banner", "-loglevel", "error",
+             "-ss", f"{max(0.0, t):.3f}", "-i", path,
+             "-frames:v", "1",
+             "-vf", f"scale=w={max_side}:h={max_side}:force_original_aspect_ratio=decrease",
+             "-f", "image2pipe", "-vcodec", "mjpeg", "-"],
+            capture_output=True, timeout=timeout, creationflags=flags)
+        if not r.stdout:
+            return None
+        return Image.open(io.BytesIO(r.stdout)).convert("RGB")
+    except Exception:
+        return None
+
+
+def extract_video_frames(path: str, base: str, n: int,
+                         max_side: int = 448, quality: int = 82,
+                         duration: float | None = None) -> int:
+    """给视频均匀抽 n 帧：f0 存 <base>.webp（代表帧），其余 <base>_f<i>.webp。
+
+    返回成功保存的帧数。单帧失败跳过，只要有一帧成功即视为部分成功。
+    """
+    if n <= 0:
+        return 0
+    dur = duration if duration and duration > 0 else video_duration(path)
+    saved = 0
+    for i in range(n):
+        # 均匀取每帧的中点时刻；尾帧往回收 0.5%，避免越过最后一帧拿不到画面
+        t = (dur * (i + 0.5) / n) if dur else (1.0 + i * 2.0)
+        if dur:
+            t = min(t, max(0.0, dur * 0.995))
+        im = grab_frame(path, t, max_side)
+        dest = f"{base}.webp" if i == 0 else f"{base}_f{i}.webp"
+        if im is not None and save_thumb(im, dest, max_side, quality):
+            saved += 1
+    return saved
+
+
+def cleanup_video_frames(base: str) -> int:
+    """删掉某个视频的额外帧缩略图（代表帧 <base>.webp 除外）。重抽前调用。"""
+    import glob
+    n = 0
+    for f in glob.glob(f"{base}_f*.webp"):
+        try:
+            os.remove(f)
+            n += 1
+        except OSError:
+            pass
+    return n
+

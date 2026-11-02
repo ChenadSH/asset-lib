@@ -238,11 +238,13 @@ def scan(cfg: Config | None = None, progress: Callable[[str], None] | None = Non
             con.executemany("UPDATE files SET status='missing' WHERE id=?", [(i,) for i in missing])
 
         # 新增 / 变更的文件进队列（file_id+job 唯一，重复入队自动忽略）
-        # 按文件体积升序入队：小图先出，页面能最快有图可看
+        # 按文件体积升序入队：小图先出，页面能最快有图可看；
+        # 视频也要抽帧，排在图片后面（worker 的 PASSES 顺序保证）
         cur_jobs = con.execute(
             "INSERT OR IGNORE INTO queue(file_id, job, created) "
             "SELECT id, 'thumb', ? FROM files "
-            "WHERE thumb=0 AND status='ready' AND kind IN ('raster','design','doc','raw') "
+            "WHERE thumb=0 AND status='ready' "
+            "AND kind IN ('raster','design','doc','raw','video') "
             "ORDER BY size ASC",
             (now,),
         )

@@ -18,17 +18,20 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .config import CFG, Config
 from .db import connect
-from .extract import extract, phash, save_thumb
+from .extract import (cleanup_video_frames, extract, ffmpeg_bin, grab_frame,
+                      phash, plan_video_frames, save_thumb, video_duration)
 
 log = logging.getLogger("worker")
 
-# 分轮次处理：TIFF 单张几百 MB，放最后，避免拖慢首屏可用时间
+# 分轮次处理：TIFF 单张几百 MB，放最后，避免拖慢首屏可用时间；
+# 视频抽帧最慢（每帧一次 seek 解码），排最末，不挤占图片的首屏时间
 PASSES = [
     ("raster", "AND f.ext NOT IN ('.tif','.tiff')"),
     ("design", ""),
     ("doc", ""),
     ("raw", ""),
     ("raster", "AND f.ext IN ('.tif','.tiff')"),
+    ("video", ""),
 ]
 
 BATCH = 240
@@ -65,7 +68,8 @@ class ThumbWorker:
     # ---------- 内部 ----------
     def _fetch(self, con, kind: str, extra: str, limit: int) -> list:
         return con.execute(
-            "SELECT q.id AS qid, q.attempts, f.id AS fid, f.dev, f.ino, f.path, f.ext "
+            "SELECT q.id AS qid, q.attempts, f.id AS fid, f.dev, f.ino, f.path, f.ext, "
+            "f.kind, f.frame_count "
             "FROM queue q JOIN files f ON f.id=q.file_id "
             "WHERE q.job='thumb' AND f.kind=? " + extra +
             " ORDER BY q.id LIMIT ?",
@@ -76,21 +80,65 @@ class ThumbWorker:
         fid = row["fid"]
         dest = os.path.join(str(self.cfg.thumb_dir), f"{row['dev']}_{row['ino']}.webp")
         try:
+            if row["kind"] == "video":
+                return self._process_video(row, dest)
             if os.path.exists(dest) and os.path.getsize(dest) > 0:
-                return (row["qid"], fid, 1, None, None)
+                return (row["qid"], fid, 1, None, None, None)
             im = extract(row["path"], row["ext"], self.cfg.thumb_max_side)
             if im is None:
-                return (row["qid"], fid, 0, None, "no_image")
+                return (row["qid"], fid, 0, None, "no_image", None)
             ph = phash(im)
             if not save_thumb(im, dest, self.cfg.thumb_max_side, self.cfg.thumb_quality):
-                return (row["qid"], fid, 0, None, "save_failed")
-            return (row["qid"], fid, 1, ph, None)
+                return (row["qid"], fid, 0, None, "save_failed", None)
+            return (row["qid"], fid, 1, ph, None, None)
         except Exception as ex:  # noqa: BLE001
-            return (row["qid"], fid, 0, None, f"{type(ex).__name__}: {ex}"[:200])
+            return (row["qid"], fid, 0, None, f"{type(ex).__name__}: {ex}"[:200], None)
+
+    def _process_video(self, row, dest: str) -> tuple:
+        """视频抽多帧：f0 作代表帧（沿用普通缩略图命名），f1.. 存 _f<i>.webp。"""
+        fid = row["fid"]
+        if not ffmpeg_bin(self.cfg):
+            return (row["qid"], fid, 0, None, "ffmpeg_not_found", None)
+        # 已抽过且代表帧还在 → 直接完成（changed 重扫进队的会被跳过，与图片行为一致）
+        if row["frame_count"] and os.path.exists(dest) and os.path.getsize(dest) > 0:
+            return (row["qid"], fid, 1, None, None, None)
+
+        dur = video_duration(row["path"])
+        if not dur:
+            return (row["qid"], fid, 0, None, "probe_failed", None)
+        vf = self.cfg.video_frames
+        n = plan_video_frames(dur, vf["per_minute"], vf["min"], vf["max"])
+
+        # 帧数可能比上一次少（配置改小），先清掉多余副帧
+        base = os.path.join(str(self.cfg.thumb_dir), f"{row['dev']}_{row['ino']}")
+        cleanup_video_frames(base)
+
+        saved = 0
+        for i in range(n):
+            if self._stop.is_set():
+                break
+            t = dur * (i + 0.5) / n
+            t = min(t, max(0.0, dur * 0.995))
+            im = grab_frame(row["path"], t, self.cfg.thumb_max_side)
+            out = dest if i == 0 else f"{base}_f{i}.webp"
+            if im is not None and save_thumb(im, out, self.cfg.thumb_max_side, self.cfg.thumb_quality):
+                saved += 1
+        if saved == 0:
+            return (row["qid"], fid, 0, None, "no_frames", None)
+        ph = None
+        try:
+            from PIL import Image
+            ph = phash(Image.open(dest))
+        except Exception:  # noqa: BLE001
+            pass
+        return (row["qid"], fid, 1, ph, None, {"frame_count": saved})
 
     def _write(self, results: list) -> bool:
         ok_ids = [r[1] for r in results if r[2] == 1]
         ph_rows = [(r[3], r[1]) for r in results if r[2] == 1 and r[3] is not None]
+        # 视频帧数写入（r[5] 是 extra dict）
+        fc_rows = [(r[5]["frame_count"], r[1]) for r in results
+                   if r[2] == 1 and r[5] and "frame_count" in r[5]]
         bad = [(r[4], r[0], r[1]) for r in results if r[2] == 0]
         ok_q = [r[0] for r in results if r[2] == 1]
 
@@ -102,6 +150,8 @@ class ThumbWorker:
                     con.executemany("UPDATE files SET thumb=1 WHERE id=?", [(i,) for i in ok_ids])
                     if ph_rows:
                         con.executemany("UPDATE files SET phash=? WHERE id=?", ph_rows)
+                    if fc_rows:
+                        con.executemany("UPDATE files SET frame_count=?, frames_done=0 WHERE id=?", fc_rows)
                 for err, qid, fid in bad:
                     row = con.execute("SELECT attempts FROM queue WHERE id=?", (qid,)).fetchone()
                     att = (row["attempts"] if row else 0) + 1

@@ -22,7 +22,7 @@ COUNT_CAP = 20000          # 全文检索的命中数上限
 COUNT_CAP_LIKE = 1000      # LIKE 路径的上限：再往上统计要全表扫，实测 1000 是性价比拐点
 RANK_LIMIT = 2000          # 小于此规模用 rank 排序，兼顾相关度
 ROW_COLS = ("f.id, f.path, f.name, f.ext, f.kind, f.size, f.mtime, f.top, f.year, "
-            "f.dev, f.ino, f.thumb, f.phash")
+            "f.dev, f.ino, f.thumb, f.phash, f.frame_count")
 
 
 def _escape_like(s: str) -> str:
@@ -73,6 +73,7 @@ def _row_to_item(r) -> dict:
         "top": r["top"],
         "year": r["year"],
         "thumb": f"/thumb/{r['dev']}_{r['ino']}" if r["thumb"] == 1 else None,
+        "frames": int(r["frame_count"] or 0) if r["kind"] == "video" else 0,
         "score": None,
         "same_source": False,
     }
