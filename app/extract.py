@@ -114,6 +114,71 @@ def _from_pdf(path: str, max_side: int) -> Image.Image | None:
         doc.close()
 
 
+def _pptx_media_fallback(path: str, max_side: int = 448) -> Image.Image | None:
+    """python-pptx 打不开或找不到图片时的兜底：直接翻 zip 的 ppt/media/。
+
+    素材库里的 PPT 失败分三类，python-pptx 全都无能为力：
+    - 内嵌视频 CRC 损坏 → 整包加载抛 BadZipFile（zip 逐 member 读可绕开）
+    - 只嵌视频、没有静态图 → 正常打开但返回 None（这时抽内嵌视频一帧）
+    - 超大文件（4GB+）→ 全量加载又慢又占内存（zip 只读 central directory）
+    """
+    import zipfile
+    try:
+        z = zipfile.ZipFile(path)
+    except Exception:
+        return None
+    pics: list[str] = []
+    vids: list[str] = []
+    for info in z.infolist():
+        low = info.filename.lower()
+        if not low.startswith("ppt/media/"):
+            continue
+        if low.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp",
+                         ".tif", ".tiff")):
+            pics.append(info.filename)
+        elif low.endswith((".mp4", ".m4v", ".mov", ".wmv", ".avi")):
+            vids.append(info.filename)
+
+    # 图片：按体积降序最多试 6 张，CRC 坏的 member 单独跳过不拖累整包
+    for name in sorted(pics, key=lambda n: z.getinfo(n).file_size, reverse=True)[:6]:
+        try:
+            im = Image.open(io.BytesIO(z.read(name)))
+            im.load()
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            if im.width >= 100 and im.height >= 100:
+                z.close()
+                return im
+        except Exception:  # noqa: BLE001
+            continue
+
+    # 没有可用图片 → 抽最大的内嵌视频一帧。media member 必须落盘再喂
+    # ffmpeg（moov 在尾的 mp4 没法从管道流式读），临时目录用完即清。
+    if vids:
+        import tempfile
+        biggest = max(vids, key=lambda n: z.getinfo(n).file_size)
+        try:
+            with tempfile.TemporaryDirectory(prefix="pptx_vid_") as td:
+                fp = os.path.join(td, "media" + os.path.splitext(biggest)[1])
+                with z.open(biggest) as src, open(fp, "wb") as dst:
+                    while True:
+                        chunk = src.read(1 << 22)
+                        if not chunk:
+                            break
+                        dst.write(chunk)
+                im = grab_frame(fp, 1.0, max_side)
+                if im is not None:
+                    z.close()
+                    return im
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        z.close()
+    except Exception:
+        pass
+    return None
+
+
 def _from_pptx(path: str) -> Image.Image | None:
     from pptx import Presentation
     prs = Presentation(path)
@@ -196,8 +261,16 @@ def extract(path: str, ext: str, max_side: int = 448) -> Image.Image | None:
         if e == ".pdf":
             return _from_pdf(path, max_side)
 
-        if e in (".pptx", ".ppt"):
+        if e in (".pptx", ".pptm"):
+            # zip 直读优先：比 python-pptx 快一个量级、省内存，还能绕开
+            # 内嵌视频 CRC 损坏；拿不到可解码图片（如全 EMF 矢量）再回退
+            im = _pptx_media_fallback(path, max_side)
+            if im is not None:
+                return im
             return _from_pptx(path)
+
+        if e == ".ppt":
+            return None  # 二进制老格式，python-pptx 不支持
 
         if e in (".dng", ".arw", ".cr2", ".cr3", ".nef", ".orf", ".raf", ".rw2"):
             return _from_raw(path)

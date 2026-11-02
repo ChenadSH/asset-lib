@@ -60,7 +60,15 @@ def _iter_files(root: str, skip: set[str]) -> "list[tuple]":
                             continue
                         stack.append(e.path)
                     elif e.is_file(follow_symlinks=False):
+                        # ~$xxx 是 PowerPoint/Word/Excel 打开时的锁文件，
+                        # 0 字节且关闭软件后残留，入库只会白占队列
+                        if e.name.startswith("~$"):
+                            continue
                         st = e.stat(follow_symlinks=False)
+                        if st.st_size == 0:
+                            continue
+                        if not st.st_ino:
+                            st = os.stat(e.path, follow_symlinks=False)
                         if not st.st_ino:
                             st = os.stat(e.path, follow_symlinks=False)
                         # Windows 的 st_dev / st_ino 是无符号 64 位（NTFS 文件索引号可能 > 2^63），
