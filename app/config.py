@@ -99,6 +99,8 @@ class Config:
     data_root: str = ""
     # 模型目录。留空 -> <data_root>/models
     model_dir: str = ""
+    # 界面标题（浏览器标签 + 左上角品牌名），多实例共用代码时按配置区分
+    site_title: str = "素材库"
     # 外挂元数据库（可选）：SQLite，assets 表按 lib_path 相对路径关联素材文件。
     # 配置后 /api/file/{id} 会附带 mldna 字段与源站链接（如 MLDNA 台账）
     meta_db: str = ""

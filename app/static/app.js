@@ -66,11 +66,21 @@ async function apiFetch(url, ms = 12000) {
 
 /* ---------------- 状态 ---------------- */
 let statusPolling = false;   // 上一轮状态轮询未结束时不再叠加，避免请求堆积
+let siteTitleApplied = false;
+function applySiteTitle(t) {
+  // 站点标题来自各实例自己的配置（config site_title）；未提供时保持默认，多实例互不影响
+  if (siteTitleApplied || !t) return;
+  siteTitleApplied = true;
+  document.title = t;
+  const n = $('#siteName');
+  if (n) n.textContent = t;
+}
 async function refreshStatus() {
   if (statusPolling) return;
   statusPolling = true;
   try {
     const s = await (await apiFetch('/api/stats', 6000)).json();
+    applySiteTitle(s.site_title);
     const pill = $('#status'), txt = $('#statusText');
     const cov = s.coverage || {};
     const vp = cov.searchable ? Math.round(cov.vectorized / cov.searchable * 100) : 0;

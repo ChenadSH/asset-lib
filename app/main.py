@@ -251,6 +251,7 @@ def api_stats():
         "last_at": _scan_state["last_at"],
     }
     st["source_online"] = os.path.isdir(CFG.source_root)
+    st["site_title"] = CFG.site_title
     try:
         from . import embed
         st["coverage"] = embed.coverage()
