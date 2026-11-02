@@ -269,6 +269,11 @@ def save_thumb(im: Image.Image, dest: str, max_side: int = 448, quality: int = 8
 # 帧文件命名：代表帧 <dev>_<ino>.webp，其余 <dev>_<ino>_f<i>.webp（i 从 1 起）。
 # 代表帧沿用普通缩略图命名，前端 /thumb/<key> 无需区分类型。
 
+# ffmpeg 原生解不了的容器：RED RAW（.r3d）需要 REDCINE-X 先转码，
+# 实测 ffmpeg 直接报 "Invalid data found when processing input"，探测时长也是 None。
+# 这类文件直接跳过，别在队列里反复重试白耗时间。
+VIDEO_SKIP = {".r3d"}
+
 _ff_cache: dict = {}
 
 
@@ -302,19 +307,28 @@ def _ffprobe_bin() -> str | None:
 
 
 def video_duration(path: str, timeout: int = 60) -> float | None:
-    """ffprobe 读容器时长（秒）。读不到返回 None（损坏 / 网络超时 / 无元数据）。"""
+    """ffprobe 读容器时长（秒）。读不到返回 None（损坏 / 网络超时 / 无元数据）。
+
+    一并确认存在视频流：素材库里有一批「wav 改名成 .avi」的假视频，
+    旧逻辑会拿着有效时长白跑 N 次 ffmpeg 才失败，现在这一层就拦掉。
+    """
     probe = _ffprobe_bin()
     if not probe:
         return None
+    import json
     import subprocess
     try:
         r = subprocess.run(
-            [probe, "-v", "error", "-show_entries", "format=duration",
-             "-of", "csv=p=0", path],
+            [probe, "-v", "error", "-show_entries",
+             "format=duration:stream=codec_type", "-of", "json", path],
             capture_output=True, timeout=timeout,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
-        out = (r.stdout or b"").decode("utf-8", "ignore").strip().splitlines()
-        return float(out[0]) if out and out[0] not in ("N/A", "") else None
+        info = json.loads((r.stdout or b"{}").decode("utf-8", "ignore") or "{}")
+        streams = info.get("streams") or []
+        if not any(s.get("codec_type") == "video" for s in streams):
+            return None
+        raw = (info.get("format") or {}).get("duration")
+        return float(raw) if raw not in (None, "N/A", "") else None
     except Exception:
         return None
 
@@ -353,38 +367,158 @@ def grab_frame(path: str, t: float, max_side: int = 448, timeout: int = 120) -> 
         return None
 
 
+def _split_jpeg(buf: bytes) -> list[bytes]:
+    """把 ffmpeg image2pipe 输出的连续 JPEG 流拆成单张。"""
+    out = []
+    i = 0
+    n = len(buf)
+    while i < n - 1:
+        s = buf.find(b"\xff\xd8", i)
+        if s < 0:
+            break
+        e = buf.find(b"\xff\xd9", s + 2)
+        if e < 0:
+            break
+        out.append(buf[s:e + 2])
+        i = e + 2
+    return out
+
+
+def plan_frame_spans(size: int, dur: float, n: int,
+                     budget: int = 200_000_000) -> list[tuple[int, int]]:
+    """把 n 帧切成若干「一次 ffmpeg 解出的区间」，返回 [(起始序号, 帧数)]。
+
+    单次 ffmpeg 的进程启动 + 容器打开是固定开销（实测 250~500ms），
+    逐帧起进程在短视频上浪费过半时间；但一股脑全片解码对高码率母版
+    （4K ProRes 动辄 100+ MB/s）是灾难。
+
+    因此按「解码该区间要读多少字节」估预算：size * span / dur，
+    超预算就切细，最细退化成逐帧 seek —— 与旧版行为一致，不会更差。
+    """
+    if n <= 0:
+        return []
+    if not dur or dur <= 0 or not size:
+        # 没有时长/体积信息时保守地逐帧处理
+        return [(i, 1) for i in range(n)]
+    step = dur / n
+    cost_per_frame = size * step / dur          # 解码一帧跨度的字节成本
+    if cost_per_frame <= 0:
+        return [(0, n)]
+    max_k = max(1, int(budget / cost_per_frame))
+    max_k = min(max_k, 8, n)                    # 单组不超过 8 帧，fps 太稀疏会丢帧
+    spans = []
+    i = 0
+    while i < n:
+        k = min(max_k, n - i)
+        spans.append((i, k))
+        i += k
+    return spans
+
+
+def _decode_span(path: str, start_i: int, count: int, dur: float, n: int,
+                 max_side: int, timeout: int = 300) -> list:
+    """一次 ffmpeg 解出 [start_i, start_i+count) 这些帧。"""
+    ff = ffmpeg_bin()
+    if not ff:
+        return []
+    import subprocess
+    step = dur / n
+
+    # 单帧必须走精确 seek：用 fps 滤镜取 1 帧时，ffmpeg 要先解码到
+    # 该组中点才吐出第一帧，对 4K ProRes 母版（145MB/s）等于白读 800MB，
+    # 实测比逐帧 seek 慢 4.5 倍。
+    if count == 1:
+        t = min(dur * (start_i + 0.5) / n, max(0.0, dur * 0.995))
+        im = grab_frame(path, t, max_side, timeout=min(timeout, 180))
+        return [im] if im is not None else []
+
+    start = max(0.0, (start_i + 0.5) * step - step * 0.5)
+    span = count * step
+    if start + span > dur:
+        span = max(step * 0.5, dur - start)
+    if span <= 0:
+        return []
+    fps = count / span
+    try:
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        r = subprocess.run(
+            [ff, "-hide_banner", "-loglevel", "error",
+             "-ss", f"{start:.3f}", "-i", path, "-t", f"{span:.3f}",
+             "-vf", f"fps={fps:.8f},"
+                    f"scale=w={max_side}:h={max_side}:force_original_aspect_ratio=decrease",
+             "-frames:v", str(count),
+             "-f", "image2pipe", "-vcodec", "mjpeg", "-"],
+            capture_output=True, timeout=timeout, creationflags=flags)
+        ims = []
+        for blob in _split_jpeg(r.stdout or b""):
+            try:
+                ims.append(Image.open(io.BytesIO(blob)).convert("RGB"))
+            except Exception:  # noqa: BLE001
+                pass
+        return ims
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def extract_video_frames(path: str, base: str, n: int,
                          max_side: int = 448, quality: int = 82,
-                         duration: float | None = None) -> int:
+                         duration: float | None = None,
+                         size: int = 0) -> int:
     """给视频均匀抽 n 帧：f0 存 <base>.webp（代表帧），其余 <base>_f<i>.webp。
 
-    返回成功保存的帧数。单帧失败跳过，只要有一帧成功即视为部分成功。
+    按解码预算分组，能合并的帧一次 ffmpeg 出（短视频通常 1 次调用搞定），
+    高码率大文件自动退化为逐帧 seek。返回成功保存的帧数。
     """
     if n <= 0:
         return 0
     dur = duration if duration and duration > 0 else video_duration(path)
+    if not dur:
+        return 0
     saved = 0
-    for i in range(n):
-        # 均匀取每帧的中点时刻；尾帧往回收 0.5%，避免越过最后一帧拿不到画面
-        t = (dur * (i + 0.5) / n) if dur else (1.0 + i * 2.0)
-        if dur:
-            t = min(t, max(0.0, dur * 0.995))
-        im = grab_frame(path, t, max_side)
-        dest = f"{base}.webp" if i == 0 else f"{base}_f{i}.webp"
-        if im is not None and save_thumb(im, dest, max_side, quality):
-            saved += 1
+    for start_i, count in plan_frame_spans(size, dur, n):
+        ims = _decode_span(path, start_i, count, dur, n, max_side)
+        for k, im in enumerate(ims):
+            i = start_i + k
+            dest = f"{base}.webp" if i == 0 else f"{base}_f{i}.webp"
+            if save_thumb(im, dest, max_side, quality):
+                saved += 1
+        # 批量解码少给了帧（fps 取整/尾部截断）时，用精确 seek 补齐
+        if len(ims) < count:
+            for k in range(len(ims), count):
+                i = start_i + k
+                t = min(dur * (i + 0.5) / n, max(0.0, dur * 0.995))
+                im = grab_frame(path, t, max_side)
+                dest = f"{base}.webp" if i == 0 else f"{base}_f{i}.webp"
+                if im is not None and save_thumb(im, dest, max_side, quality):
+                    saved += 1
     return saved
 
 
-def cleanup_video_frames(base: str) -> int:
-    """删掉某个视频的额外帧缩略图（代表帧 <base>.webp 除外）。重抽前调用。"""
-    import glob
+def cleanup_video_frames(base: str, keep: int = 0) -> int:
+    """删掉序号 > keep 的副帧（代表帧 <base>.webp 永不删）。
+
+    只在重抽的帧数比上次少时才调用：缩略图目录有 20 万文件，
+    每次 glob 要 600ms，绝不能放进热路径。
+    """
+    d = os.path.dirname(base)
+    prefix = os.path.basename(base) + "_f"
     n = 0
-    for f in glob.glob(f"{base}_f*.webp"):
-        try:
-            os.remove(f)
-            n += 1
-        except OSError:
-            pass
+    try:
+        with os.scandir(d) as it:
+            for e in it:
+                if not e.name.startswith(prefix):
+                    continue
+                try:
+                    idx = int(e.name[len(prefix):-5])
+                except ValueError:
+                    continue
+                if idx > keep:
+                    try:
+                        os.remove(e.path)
+                        n += 1
+                    except OSError:
+                        pass
+    except OSError:
+        pass
     return n
 

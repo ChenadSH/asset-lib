@@ -18,20 +18,23 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .config import CFG, Config
 from .db import connect
-from .extract import (cleanup_video_frames, extract, ffmpeg_bin, grab_frame,
-                      phash, plan_video_frames, save_thumb, video_duration)
+from .extract import (VIDEO_SKIP, cleanup_video_frames, extract,
+                      extract_video_frames, ffmpeg_bin, phash,
+                      plan_video_frames, save_thumb, video_duration)
 
 log = logging.getLogger("worker")
 
 # 分轮次处理：TIFF 单张几百 MB，放最后，避免拖慢首屏可用时间；
-# 视频抽帧最慢（每帧一次 seek 解码），排最末，不挤占图片的首屏时间
+# 视频抽帧最慢（每帧一次 seek 解码），排最末，不挤占图片的首屏时间。
+# 第三项是排序键：视频按体积升序，让大量小片子先出图，
+# 几百 MB 的母版丢到队尾慢慢磨，避免用户以为「所有视频都没预览图」。
 PASSES = [
-    ("raster", "AND f.ext NOT IN ('.tif','.tiff')"),
-    ("design", ""),
-    ("doc", ""),
-    ("raw", ""),
-    ("raster", "AND f.ext IN ('.tif','.tiff')"),
-    ("video", ""),
+    ("raster", "AND f.ext NOT IN ('.tif','.tiff')", "q.id"),
+    ("design", "", "q.id"),
+    ("doc", "", "q.id"),
+    ("raw", "", "q.id"),
+    ("raster", "AND f.ext IN ('.tif','.tiff')", "q.id"),
+    ("video", "", "f.size"),
 ]
 
 BATCH = 240
@@ -66,13 +69,14 @@ class ThumbWorker:
             con.close()
 
     # ---------- 内部 ----------
-    def _fetch(self, con, kind: str, extra: str, limit: int) -> list:
+    def _fetch(self, con, kind: str, extra: str, limit: int,
+               order: str = "q.id") -> list:
         return con.execute(
             "SELECT q.id AS qid, q.attempts, f.id AS fid, f.dev, f.ino, f.path, f.ext, "
-            "f.kind, f.frame_count "
+            "f.kind, f.frame_count, f.size "
             "FROM queue q JOIN files f ON f.id=q.file_id "
             "WHERE q.job='thumb' AND f.kind=? " + extra +
-            " ORDER BY q.id LIMIT ?",
+            " ORDER BY " + order + " LIMIT ?",
             (kind, limit),
         ).fetchall()
 
@@ -97,11 +101,20 @@ class ThumbWorker:
     def _process_video(self, row, dest: str) -> tuple:
         """视频抽多帧：f0 作代表帧（沿用普通缩略图命名），f1.. 存 _f<i>.webp。"""
         fid = row["fid"]
+        if row["ext"].lower() in VIDEO_SKIP:
+            return (row["qid"], fid, 0, None, "unsupported_container", None)
         if not ffmpeg_bin(self.cfg):
             return (row["qid"], fid, 0, None, "ffmpeg_not_found", None)
-        # 已抽过且代表帧还在 → 直接完成（changed 重扫进队的会被跳过，与图片行为一致）
-        if row["frame_count"] and os.path.exists(dest) and os.path.getsize(dest) > 0:
-            return (row["qid"], fid, 1, None, None, None)
+
+        base = os.path.join(str(self.cfg.thumb_dir), f"{row['dev']}_{row['ino']}")
+        fc = row["frame_count"] or 0
+        # 已抽过且代表帧还在 → 直接完成（changed 重扫进队的会被跳过，与图片行为一致）。
+        # 但要多验一个末帧：抽帧中途被打断会留下「有代表帧、帧条缺失」的残局，
+        # 只查代表帧会把这种半成品永久当成已完成。
+        if fc and os.path.exists(dest) and os.path.getsize(dest) > 0:
+            last = f"{base}_f{fc - 1}.webp" if fc > 1 else dest
+            if os.path.exists(last):
+                return (row["qid"], fid, 1, None, None, None)
 
         dur = video_duration(row["path"])
         if not dur:
@@ -109,20 +122,16 @@ class ThumbWorker:
         vf = self.cfg.video_frames
         n = plan_video_frames(dur, vf["per_minute"], vf["min"], vf["max"])
 
-        # 帧数可能比上一次少（配置改小），先清掉多余副帧
-        base = os.path.join(str(self.cfg.thumb_dir), f"{row['dev']}_{row['ino']}")
-        cleanup_video_frames(base)
+        # 帧数可能比上一次少（配置改小），先清掉多余副帧。
+        # 注意：缩略图目录有 20 万文件，扫一次要 600ms，只能在这里按需调用，
+        # 绝不能无条件放在每个视频的热路径上。
+        if fc > n:
+            cleanup_video_frames(base, keep=n)
 
-        saved = 0
-        for i in range(n):
-            if self._stop.is_set():
-                break
-            t = dur * (i + 0.5) / n
-            t = min(t, max(0.0, dur * 0.995))
-            im = grab_frame(row["path"], t, self.cfg.thumb_max_side)
-            out = dest if i == 0 else f"{base}_f{i}.webp"
-            if im is not None and save_thumb(im, out, self.cfg.thumb_max_side, self.cfg.thumb_quality):
-                saved += 1
+        saved = extract_video_frames(row["path"], base, n,
+                                     self.cfg.thumb_max_side,
+                                     self.cfg.thumb_quality,
+                                     duration=dur, size=row["size"] or 0)
         if saved == 0:
             return (row["qid"], fid, 0, None, "no_frames", None)
         ph = None
@@ -187,8 +196,8 @@ class ThumbWorker:
         try:
             while not self._stop.is_set():
                 batch = []
-                for kind, extra in PASSES:
-                    batch = self._fetch(read_con, kind, extra, BATCH)
+                for kind, extra, order in PASSES:
+                    batch = self._fetch(read_con, kind, extra, BATCH, order)
                     if batch:
                         break
                 if not batch:
