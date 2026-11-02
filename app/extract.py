@@ -419,7 +419,13 @@ def plan_video_frames(duration: float | None, per_minute: int = 5,
 
 
 def grab_frame(path: str, t: float, max_side: int = 448, timeout: int = 120) -> Image.Image | None:
-    """取视频 t 秒处一帧，经 stdout 管道直读内存，全程不落盘。"""
+    """取视频 t 秒处一帧，经 stdout 管道直读内存，全程不落盘。
+
+    `-threads 1` 是关键：解一帧本来就没有并行度，ffmpeg 默认却按 CPU 核数
+    拉起线程池，光线程创建就比解码本身贵。实测 2.3GB/45s 的 ProRes 母版，
+    单帧 2738ms → 905ms（3×）；多 worker 并发时差距更大，因为每个进程都在
+    抢满核，谁也跑不快。
+    """
     ff = ffmpeg_bin()
     if not ff:
         return None
@@ -427,7 +433,7 @@ def grab_frame(path: str, t: float, max_side: int = 448, timeout: int = 120) -> 
     try:
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         r = subprocess.run(
-            [ff, "-hide_banner", "-loglevel", "error",
+            [ff, "-hide_banner", "-loglevel", "error", "-threads", "1",
              "-ss", f"{max(0.0, t):.3f}", "-i", path,
              "-frames:v", "1",
              "-vf", f"scale=w={max_side}:h={max_side}:force_original_aspect_ratio=decrease",
@@ -458,15 +464,16 @@ def _split_jpeg(buf: bytes) -> list[bytes]:
 
 
 def plan_frame_spans(size: int, dur: float, n: int,
-                     budget: int = 200_000_000) -> list[tuple[int, int]]:
+                     budget: int = 40_000_000) -> list[tuple[int, int]]:
     """把 n 帧切成若干「一次 ffmpeg 解出的区间」，返回 [(起始序号, 帧数)]。
 
     单次 ffmpeg 的进程启动 + 容器打开是固定开销（实测 250~500ms），
     逐帧起进程在短视频上浪费过半时间；但一股脑全片解码对高码率母版
-    （4K ProRes 动辄 100+ MB/s）是灾难。
+    （4K ProRes 40+ MB/s）是灾难 —— 339MB/8s 的片子全片解 5 帧要 12s，
+    而逐帧 seek 只要 4.5s。
 
-    因此按「解码该区间要读多少字节」估预算：size * span / dur，
-    超预算就切细，最细退化成逐帧 seek —— 与旧版行为一致，不会更差。
+    按「解码该区间要读多少字节」估预算：size * span / dur，超预算就切细，
+    最细退化成逐帧 seek（-threads 1，实测 0.9s/帧），不会更差。
     """
     if n <= 0:
         return []
@@ -515,7 +522,7 @@ def _decode_span(path: str, start_i: int, count: int, dur: float, n: int,
     try:
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         r = subprocess.run(
-            [ff, "-hide_banner", "-loglevel", "error",
+            [ff, "-hide_banner", "-loglevel", "error", "-threads", "4",
              "-ss", f"{start:.3f}", "-i", path, "-t", f"{span:.3f}",
              "-vf", f"fps={fps:.8f},"
                     f"scale=w={max_side}:h={max_side}:force_original_aspect_ratio=decrease",
