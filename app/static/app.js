@@ -260,10 +260,12 @@ function placeholder(it) {
 
 /* ---------------- 灯箱 ---------------- */
 let current = null;
+let currentFrame = 0;      // 灯箱当前显示的帧号：找相似要跟着它走，而不是永远第 0 帧
 let mldnaSeq = 0;          // 防止快速切换卡片时旧响应写入新面板
 
 function openLightbox(it) {
   current = it;
+  currentFrame = Number.isInteger(it.frame) && it.frame > 0 ? it.frame : 0;
   $('#lbName').textContent = it.name;
   $('#lbPath').textContent = it.path;
   $('#lbMeta').textContent = [
@@ -301,7 +303,9 @@ function renderFrameStrip(it) {
     img.title = `第 ${i + 1} 帧`;
     if (i === cur) img.className = 'on';
     img.onclick = () => {
+      currentFrame = i;
       $('#lbImg').src = img.src;
+      label.textContent = `${it.frames} 个画面帧${i > 0 ? ` · 当前第 ${i + 1} 帧` : ''}`;
       row.querySelectorAll('img').forEach(x => x.classList.remove('on'));
       img.classList.add('on');
     };
@@ -683,6 +687,13 @@ $('#lbCopy').onclick = async () => {
 };
 $('#lbSimilar').onclick = async () => {
   if (!current) return;
+  // 视频且灯箱停在某个画面帧上：以当前帧找相似。
+  // 之前永远走 /api/similar/{id}，那个接口固定取第 0 帧向量，
+  // 用户点了第 4 帧再点「找相似」，搜的却是封面。
+  if (current.kind === 'video' && current.frames) {
+    searchByFrame(current.id, currentFrame, $('#lbImg').src);
+    return;
+  }
   const c = current;
   closeLightbox();
   state.seq++;
@@ -705,8 +716,7 @@ $('#lbSimilar').onclick = async () => {
   setProgress(25, '找同源与相似…');
   const t0 = performance.now();
   try {
-    const r = await fetch('/api/similar/' + c.id + '?limit=60');
-    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || '服务返回 ' + r.status);
+    const r = await fetch('/api/similar/' + c.id + '?limit=60');    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || '服务返回 ' + r.status);
     const d = await r.json();
     setProgress(88, '整理结果…');
     renderImageResult(d, performance.now() - t0);
