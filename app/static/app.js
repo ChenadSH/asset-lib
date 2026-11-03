@@ -690,7 +690,8 @@ $('#lbSimilar').onclick = async () => {
   // 视频且灯箱停在某个画面帧上：以当前帧找相似。
   // 之前永远走 /api/similar/{id}，那个接口固定取第 0 帧向量，
   // 用户点了第 4 帧再点「找相似」，搜的却是封面。
-  if (current.kind === 'video' && current.frames) {
+  // 停在第 0 帧时保持原路径：那条走「指纹 + 向量」两段式，能多出同源结果。
+  if (current.kind === 'video' && current.frames && currentFrame > 0) {
     searchByFrame(current.id, currentFrame, $('#lbImg').src);
     return;
   }
