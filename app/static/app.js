@@ -229,7 +229,13 @@ function renderCard(it) {
     tw.appendChild(placeholder(it));
   }
   if (it.same_source) card.appendChild(el('div', 'badge src', '同源'));
-  if (it.kind === 'video' && it.frames) card.appendChild(el('div', 'badge frames', it.frames + ' 帧'));
+  if (it.kind === 'video' && it.frames) {
+    // 命中哪一帧就标哪一帧：视频的每个画面都能被图搜图搜到，
+    // 只写「5 帧」会让用户误以为只有封面参与了检索。
+    const hit = Number.isInteger(it.frame) && it.frame > 0;
+    card.appendChild(el('div', 'badge frames',
+      hit ? `第 ${it.frame + 1}/${it.frames} 帧` : `${it.frames} 帧`));
+  }
   card.appendChild(tw);
 
   const cap = el('div', 'cap');
@@ -281,8 +287,10 @@ function renderFrameStrip(it) {
   const box = $('#lbFrames');
   box.innerHTML = '';
   if (it.kind !== 'video' || !it.frames || !it.thumb) { box.hidden = true; return; }
-  const key = it.thumb.replace('/thumb/', '');
-  const label = el('div', 'fr-label', `${it.frames} 个画面帧`);
+  // 结果卡片可能给的是某一帧的地址（..._f3），帧条要用视频的基础 key
+  const key = it.frame_key || it.thumb.replace('/thumb/', '').replace(/_f\d+$/, '');
+  const cur = Number.isInteger(it.frame) ? it.frame : 0;
+  const label = el('div', 'fr-label', `${it.frames} 个画面帧${cur > 0 ? ` · 当前第 ${cur + 1} 帧` : ''}`);
   box.appendChild(label);
   const row = el('div', 'fr-row');
   for (let i = 0; i < it.frames; i++) {
@@ -291,7 +299,12 @@ function renderFrameStrip(it) {
     img.loading = 'lazy';
     img.src = `/thumb/${k}`;
     img.title = `第 ${i + 1} 帧`;
-    img.onclick = () => { $('#lbImg').src = img.src; };
+    if (i === cur) img.className = 'on';
+    img.onclick = () => {
+      $('#lbImg').src = img.src;
+      row.querySelectorAll('img').forEach(x => x.classList.remove('on'));
+      img.classList.add('on');
+    };
     img.ondblclick = () => searchByFrame(it.id, i, img.src);
     row.appendChild(img);
   }

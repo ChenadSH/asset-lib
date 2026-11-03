@@ -64,10 +64,13 @@ CREATE TABLE IF NOT EXISTS meta (
   v TEXT
 );
 
--- 视频帧的向量映射：一个视频多帧多向量，全部指向同一 file_id
+-- 视频帧的向量映射：一个视频多帧多向量，全部指向同一 file_id。
+-- frame_idx 记录这一行向量对应第几帧（0 = 代表帧），检索命中后要能
+-- 直接展示「命中的那一帧」，否则所有结果都只能显示封面。
 CREATE TABLE IF NOT EXISTS video_vec_map (
-  file_id INTEGER NOT NULL,
-  vec_row INTEGER NOT NULL,
+  file_id   INTEGER NOT NULL,
+  vec_row   INTEGER NOT NULL,
+  frame_idx INTEGER DEFAULT 0,
   UNIQUE(file_id, vec_row)
 );
 CREATE INDEX IF NOT EXISTS idx_vvm_row ON video_vec_map(vec_row);
@@ -113,6 +116,19 @@ def init_db(path: Path | None = None) -> None:
             con.execute("ALTER TABLE files ADD COLUMN frame_count INTEGER DEFAULT 0")
         if "frames_done" not in cols:
             con.execute("ALTER TABLE files ADD COLUMN frames_done INTEGER DEFAULT 0")
+        vcols = {r[1] for r in con.execute("PRAGMA table_info(video_vec_map)")}
+        if vcols and "frame_idx" not in vcols:
+            con.execute("ALTER TABLE video_vec_map ADD COLUMN frame_idx INTEGER DEFAULT 0")
+            # 历史数据回填：帧向量是按帧号顺序连续追加的，按 vec_row 排序即帧序。
+            # 用临时表一次性重建（相关子查询在 12 万行上是 O(n²)，要跑几十分钟）。
+            con.execute("CREATE TEMP TABLE _vvm AS "
+                        "SELECT file_id, vec_row, "
+                        "row_number() OVER (PARTITION BY file_id ORDER BY vec_row) - 1 AS fidx "
+                        "FROM video_vec_map")
+            con.execute("DELETE FROM video_vec_map")
+            con.execute("INSERT INTO video_vec_map(file_id, vec_row, frame_idx) "
+                        "SELECT file_id, vec_row, fidx FROM _vvm")
+            con.execute("DROP TABLE _vvm")
         con.commit()
     finally:
         con.close()

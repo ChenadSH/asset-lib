@@ -148,6 +148,7 @@ mark{background:#fff2b8;color:inherit;border-radius:2px;padding:0 1px}
   transition:.12s;background:#f0f2f4;
 }
 .lb-frames .fr-row img:hover{border-color:var(--teal);transform:translateY(-1px)}
+.lb-frames .fr-row img.on{border-color:var(--teal);box-shadow:0 0 0 2px rgba(0,150,180,.18)}
 
 .empty{text-align:center;padding:90px 20px;color:var(--ink3)}
 .empty .et{font-size:15px;color:var(--ink2);margin:0 0 6px}

@@ -107,7 +107,8 @@ class VectorStore:
         self.dim = dim
         self.mat: np.memmap | None = None
         self.count = 0
-        self.ids = np.zeros(0, dtype=np.int64)  # row -> file_id
+        self.ids = np.zeros(0, dtype=np.int64)     # row -> file_id
+        self.frames = np.zeros(0, dtype=np.int16)  # row -> 帧号，-1 表示普通图片
         self._load()
 
     def _load(self) -> None:
@@ -115,6 +116,18 @@ class VectorStore:
         try:
             self.count = int(get_meta(con, "vec_count", "0") or 0)
             rows = con.execute("SELECT vec_row, id FROM files WHERE vec_row IS NOT NULL").fetchall()
+            # 视频多帧向量：所有帧的 vec_row 都映射回同一 file_id。
+            # 注意必须在 close 之前查完 —— 之前这里在 finally 之后才用 con，
+            # 每次都抛 ProgrammingError 被 except 吞掉，结果只有第 0 帧被映射，
+            # 其余帧的 id 全是 0，在检索里被当作无效行丢弃。
+            try:
+                vrows = con.execute(
+                    "SELECT vec_row, file_id, coalesce(frame_idx, 0) AS fi "
+                    "FROM video_vec_map").fetchall()
+            except Exception as ex:  # noqa: BLE001  老库没有 frame_idx 列时退化为按 0 处理
+                log.debug("video_vec_map 读取失败（%s），回退只读映射", ex)
+                vrows = con.execute(
+                    "SELECT vec_row, file_id, 0 AS fi FROM video_vec_map").fetchall()
         finally:
             con.close()
 
@@ -129,16 +142,14 @@ class VectorStore:
             log.info("新建向量库 %s，容量 %d × %d", self.path.name, cap, self.dim)
 
         self.ids = np.zeros(cap, dtype=np.int64)
+        self.frames = np.full(cap, -1, dtype=np.int16)
         for r in rows:
             if 0 <= r["vec_row"] < cap:
                 self.ids[r["vec_row"]] = r["id"]
-        # 视频多帧向量：所有帧的 vec_row 都映射回同一 file_id
-        try:
-            for r in con.execute("SELECT vec_row, file_id FROM video_vec_map"):
-                if 0 <= r["vec_row"] < cap:
-                    self.ids[r["vec_row"]] = r["file_id"]
-        except Exception:
-            pass
+        for r in vrows:
+            if 0 <= r["vec_row"] < cap:
+                self.ids[r["vec_row"]] = r["file_id"]
+                self.frames[r["vec_row"]] = int(r["fi"])
 
     @property
     def capacity(self) -> int:
@@ -186,6 +197,9 @@ class VectorStore:
         ids = np.zeros(new_cap, dtype=np.int64)
         ids[: self.ids.shape[0]] = self.ids
         self.ids = ids
+        frames = np.full(new_cap, -1, dtype=np.int16)
+        frames[: self.frames.shape[0]] = self.frames
+        self.frames = frames
 
     def append(self, vecs: np.ndarray) -> int:
         self._ensure_loaded()
@@ -219,24 +233,34 @@ class VectorStore:
             rows = con.execute(
                 "SELECT vec_row, id FROM files WHERE vec_row >= ? AND vec_row < ?",
                 (self.count, cur)).fetchall()
-            # 视频多帧向量同样增量补映射
+            # 视频多帧向量同样增量补映射（连同帧号）
             try:
                 rows += con.execute(
-                    "SELECT vec_row, file_id AS id FROM video_vec_map "
+                    "SELECT vec_row, file_id AS id, coalesce(frame_idx, 0) AS fi "
+                    "FROM video_vec_map "
                     "WHERE vec_row >= ? AND vec_row < ?", (self.count, cur)).fetchall()
             except Exception:
-                pass
+                rows += con.execute(
+                    "SELECT vec_row, file_id AS id, 0 AS fi FROM video_vec_map "
+                    "WHERE vec_row >= ? AND vec_row < ?", (self.count, cur)).fetchall()
         finally:
             con.close()
         for r in rows:
-            self.ids[r["vec_row"]] = r["id"]
+            if 0 <= r["vec_row"] < self.ids.shape[0]:
+                self.ids[r["vec_row"]] = r["id"]
+                try:
+                    self.frames[r["vec_row"]] = int(r["fi"])
+                except (IndexError, KeyError, TypeError):
+                    pass
         self.count = cur
         return True
 
-    def normalize_and_search(self, q: np.ndarray, topk: int = 200) -> tuple[np.ndarray, np.ndarray]:
+    def normalize_and_search(self, q: np.ndarray, topk: int = 200
+                             ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         self._ensure_loaded()
         if self.count == 0 or self.mat is None:
-            return np.zeros(0), np.zeros(0, dtype=np.int64)
+            return (np.zeros(0), np.zeros(0, dtype=np.int64),
+                    np.zeros(0, dtype=np.int16))
         m = np.asarray(self.mat[: self.count])
         q = q.astype(np.float32).reshape(-1)
         q /= (np.linalg.norm(q) + 1e-8)
@@ -244,7 +268,7 @@ class VectorStore:
         k = min(topk, self.count)
         idx = np.argpartition(-sims, k - 1)[:k]
         idx = idx[np.argsort(-sims[idx])]
-        return sims[idx], self.ids[idx]
+        return sims[idx], self.ids[idx], self.frames[idx]
 
 
 _STORE: VectorStore | None = None
@@ -430,8 +454,8 @@ def _encode_video_frames(con, st, model, proc, dev, r, say) -> int:
     vecs = np.concatenate(vecs_all)
 
     start = st.append(vecs)
-    con.executemany("INSERT OR IGNORE INTO video_vec_map(file_id, vec_row) VALUES(?,?)",
-                    [(fid, start + i) for i in range(len(paths))])
+    con.executemany("INSERT OR IGNORE INTO video_vec_map(file_id, vec_row, frame_idx) VALUES(?,?,?)",
+                    [(fid, start + k, int(paths[k][0])) for k in range(len(paths))])
     con.execute("UPDATE files SET vec_row=? WHERE id=? AND vec_row IS NULL", (start, fid))
     con.execute("UPDATE files SET frames_done=? WHERE id=?", (done + len(paths), fid))
     set_meta(con, "vec_count", str(st.count))
@@ -699,8 +723,15 @@ def _fetch_rows(ids) -> dict:
         con.close()
 
 
-def _item(r, score=None, dist=None) -> dict:
+def _item(r, score=None, dist=None, frame=None) -> dict:
     same = dist is not None and dist <= PHASH_SAME
+    n_frames = int(r["frame_count"] or 0) if "frame_count" in r.keys() else 0
+    # 命中的是哪一帧就展示哪一帧：视频 5 个画面都能被图搜图命中，
+    # 结果里必须给出对应画面，否则用户只看到封面，会以为只有第一帧可搜。
+    fi = int(frame) if frame is not None else 0
+    if fi <= 0 or fi >= n_frames:
+        fi = 0
+    key = f"{r['dev']}_{r['ino']}"
     return {
         "id": r["id"],
         "name": r["name"] + (r["ext"] or ""),
@@ -711,8 +742,10 @@ def _item(r, score=None, dist=None) -> dict:
         "mtime": r["mtime"],
         "top": r["top"],
         "year": r["year"],
-        "thumb": f"/thumb/{r['dev']}_{r['ino']}" if r["thumb"] == 1 else None,
-        "frames": int(r["frame_count"] or 0) if "frame_count" in r.keys() else 0,
+        "thumb": f"/thumb/{key}" + (f"_f{fi}" if fi else "") if r["thumb"] == 1 else None,
+        "frames": n_frames,
+        "frame": fi if n_frames else None,
+        "frame_key": key if n_frames else None,
         "score": None if score is None else round(float(score), 4),
         "dist": dist,
         "match": "fingerprint" if same else "vector",
@@ -740,19 +773,23 @@ def _assemble(qvec, limit: int, fp: list | None = None) -> dict:
     t1 = time.perf_counter()
     vec_items = []
     if qvec is not None:
-        sims, ids = store().normalize_and_search(qvec, max(200, limit * 3))
-        # 一个视频有多个帧向量，去重后保留最高分，避免同一视频占满结果
-        best: dict[int, float] = {}
-        for i, s in zip(ids.tolist(), sims.tolist()):
-            fid = int(i)
-            if fid and fid not in seen and s > best.get(fid, -2.0):
-                best[fid] = s
-        pairs = sorted(best.items(), key=lambda kv: -kv[1])
+        sims, ids, frames = store().normalize_and_search(qvec, max(200, limit * 3))
+        # 一个视频有多个帧向量：同一视频只占一个位置，但保留「命中的最强帧」，
+        # 这样结果卡片直接显示对上的那个画面，而不是永远显示封面。
+        best: dict[int, tuple[float, int]] = {}
+        for fid, s, f in zip(ids.tolist(), sims.tolist(), frames.tolist()):
+            fid = int(fid)
+            if not fid or fid in seen:
+                continue
+            prev = best.get(fid)
+            if prev is None or s > prev[0]:
+                best[fid] = (s, int(f))
+        pairs = sorted(best.items(), key=lambda kv: -kv[1][0])
         rows2 = _fetch_rows([fid for fid, _ in pairs])
-        for fid, s in pairs:
+        for fid, (s, f) in pairs:
             r = rows2.get(fid)
             if r:
-                vec_items.append(_item(r, s, None))
+                vec_items.append(_item(r, s, None, f))
     t_vec = (time.perf_counter() - t1) * 1000
 
     fp_items.sort(key=lambda x: x["dist"])
@@ -880,26 +917,50 @@ def search_by_file_id(fid: int, limit: int = 60) -> dict:
 
 
 def search_by_frame(fid: int, idx: int, limit: int = 60) -> dict:
-    """以视频第 idx 帧画面找相似。帧向量虽已入库但都映射回视频本身，
-    这里现场对指定帧编码一份向量，才能真正做到「按这一帧找」。"""
+    """以视频第 idx 帧画面找相似。
+
+    帧向量早已入库（video_vec_map），直接取那一行即可，不必重新跑 CLIP；
+    查不到映射（老库/刚抽完帧还没编码）才退回现场编码。
+    """
     t0 = time.perf_counter()
     con = connect(readonly=True)
     try:
-        r = con.execute("SELECT phash, thumb, dev, ino, frame_count FROM files WHERE id=?",
+        r = con.execute("SELECT phash, thumb, dev, ino, frame_count, vec_row FROM files WHERE id=?",
                         (fid,)).fetchone()
+        vrow = None
+        if r and int(r["frame_count"] or 0) > 0:
+            try:
+                vr = con.execute("SELECT vec_row FROM video_vec_map WHERE file_id=? AND frame_idx=? LIMIT 1",
+                                 (fid, idx)).fetchone()
+                vrow = vr["vec_row"] if vr else None
+            except Exception:  # noqa: BLE001
+                vrow = None
     finally:
         con.close()
     if not r or not r["thumb"] or idx >= int(r["frame_count"] or 0):
         return {"mode": "image", "total": 0, "items": [], "took_ms": 0}
 
-    base = CFG.thumb_dir / f"{r['dev']}_{r['ino']}"
-    p = base.with_suffix(".webp") if idx == 0 else Path(f"{base}_f{idx}.webp")
     qv = None
-    try:
-        from PIL import Image
-        qv = _encode_image(Image.open(p))
-    except Exception as ex:  # noqa: BLE001
-        log.debug("帧现场编码失败 fid=%s f%d: %s", fid, idx, ex)
+    st = store()
+    if vrow is not None and st.mat is not None:
+        try:
+            qv = np.asarray(st.mat[vrow]).astype(np.float32)
+        except Exception:  # noqa: BLE001
+            qv = None
+    if qv is None:
+        base = CFG.thumb_dir / f"{r['dev']}_{r['ino']}"
+        p = base.with_suffix(".webp") if idx == 0 else Path(f"{base}_f{idx}.webp")
+        try:
+            from PIL import Image
+            qv = _encode_image(Image.open(p))
+        except Exception as ex:  # noqa: BLE001
+            log.debug("帧现场编码失败 fid=%s f%d: %s", fid, idx, ex)
+
+    res = _assemble(qv, limit + 1)
+    items = [x for x in res["items"] if x["id"] != fid][:limit]
+    return {"mode": "image", "total": len(items), "items": items,
+            "same_source": res["same_source"], "coverage": coverage(),
+            "took_ms": round((time.perf_counter() - t0) * 1000, 1)}
 
     res = _assemble(qv, limit + 1)
     items = [x for x in res["items"] if x["id"] != fid][:limit]
