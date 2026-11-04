@@ -31,7 +31,8 @@ const MTYPE_LABEL = {
   doc: '文档', design: '设计源文件', raw: 'RAW 原片', audio: '音频',
 };
 const DUR_LABEL = {
-  s15: '≤ 15 秒', s60: '15–60 秒', m5: '1–5 分钟', m30: '5–30 分钟', m30p: '> 30 分钟',
+  s30: '> 30 秒', m1: '> 1 分钟', m2: '> 2 分钟',
+  m5: '> 5 分钟', m10: '> 10 分钟', m30: '> 30 分钟',
 };
 const ORIENT_LABEL = { h: '横屏', v: '竖屏', sq: '方图' };
 
@@ -142,7 +143,14 @@ async function loadFacets() {
     (f.durs || []).filter(d => d[1] > 0).forEach(([k, n]) => {
       const b = el('button', 'chip', `${DUR_LABEL[k] || k}<span class="n">${n.toLocaleString()}</span>`);
       b.dataset.v = k;
-      b.onclick = () => { toggleSet(state.durs, k); b.classList.toggle('on'); reset(); };
+      // 阈值是递增的，多选只会退化成最宽松的那一档，所以做成单选（点第二下取消）
+      b.onclick = () => {
+        const turnOn = !b.classList.contains('on');
+        dc.querySelectorAll('button.chip').forEach(x => x.classList.remove('on'));
+        state.durs.clear();
+        if (turnOn) { state.durs.add(k); b.classList.add('on'); }
+        reset();
+      };
       dc.appendChild(b);
     });
     const dl = el('span', 'flabel', '时长');
@@ -841,6 +849,25 @@ new IntersectionObserver(entries => {
 // 交叉观察器的兜底：滚动时再确认一次，避免 sentinel 一直在视口内导致不再触发
 window.addEventListener('scroll', () => maybeLoadMore(), { passive: true });
 $('#moreBtn').onclick = () => { if (!state.loading && !state.done) search(true); };
+
+/* 筛选条会随 chips 数量/窗口宽度换行，高度是动态的；
+   meta 行要贴住它吸顶，所以把实测高度写进 CSS 变量，而不是写死 top 值 */
+const filtersEl = $('#filters');
+function syncFiltersH() {
+  document.documentElement.style.setProperty('--filters-h', filtersEl.offsetHeight + 'px');
+}
+syncFiltersH();
+new ResizeObserver(syncFiltersH).observe(filtersEl);
+window.addEventListener('resize', syncFiltersH);
+
+/* 返回顶部 */
+const backTopBtn = $('#backTop');
+function syncBackTop() {
+  backTopBtn.classList.toggle('on', window.scrollY > 800);
+}
+window.addEventListener('scroll', syncBackTop, { passive: true });
+backTopBtn.onclick = () => window.scrollTo({ top: 0, behavior: 'smooth' });
+syncBackTop();
 
 /* 启动 */
 (async function init() {

@@ -133,6 +133,11 @@ def init_db(path: Path | None = None) -> None:
                 con.execute(f"ALTER TABLE files ADD COLUMN {cname} {ddl}")
         con.execute("CREATE INDEX IF NOT EXISTS idx_mtype  ON files(mtype)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_orient ON files(orient)")
+        # 时长筛选是「>= 阈值」的范围条件，没索引时 count 要全表扫（实测 166ms）；
+        # 复合 (kind, duration) 能把扫描限制在视频子集，count 降到 <1ms。
+        # 单列 idx_duration 被它完全覆盖，删掉省空间。
+        con.execute("DROP INDEX IF EXISTS idx_duration")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_kind_dur ON files(kind, duration)")
         # mtype 由扩展名纯派生，直接回填历史数据（27 万行 < 5s）
         if con.execute("SELECT count(*) c FROM files WHERE mtype IS NULL").fetchone()["c"]:
             from .config import MTYPE_MAP

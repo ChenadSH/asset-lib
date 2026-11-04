@@ -24,21 +24,18 @@ RANK_LIMIT = 2000          # 小于此规模用 rank 排序，兼顾相关度
 ROW_COLS = ("f.id, f.path, f.name, f.ext, f.kind, f.size, f.mtime, f.top, f.year, "
             "f.dev, f.ino, f.thumb, f.phash, f.frame_count, f.duration, f.orient")
 
-# 视频时长分桶（秒）。前端 chip 的值就是这里的 key。
-DUR_BUCKETS = [
-    ("s15",  0,    15),
-    ("s60",  15,   60),
-    ("m5",   60,   300),
-    ("m30",  300,  1800),
-    ("m30p", 1800, None),
-]
-DUR_SQL = {
-    "s15":  "f.duration >= 0 AND f.duration <= 15",
-    "s60":  "f.duration > 15 AND f.duration <= 60",
-    "m5":   "f.duration > 60 AND f.duration <= 300",
-    "m30":  "f.duration > 300 AND f.duration <= 1800",
-    "m30p": "f.duration > 1800",
+# 视频时长门槛（秒）。语义是「不短于」：chip 值 = 下限，前端单选、互斥。
+# 分桶（≤15 / 15-60 …）对找素材没有意义——用户想问的是「有没有长一点的片子」，
+# 所以从「大于 30 秒」开始逐档抬高下限，每档的数字就是「全库有多少条满足」。
+DUR_THRESH = {
+    "s30":  30,
+    "m1":   60,
+    "m2":   120,
+    "m5":   300,
+    "m10":  600,
+    "m30":  1800,
 }
+DUR_SQL = {k: f"f.duration >= {v}" for k, v in DUR_THRESH.items()}
 # 横竖屏：h 横屏 / v 竖屏 / sq 方图（按缩略图长宽比判定，比例在 1.05 内视为方图）
 
 
@@ -78,9 +75,14 @@ def _filters(kinds, tops, years, mtypes=None, orients=None, durs=None,
         if keys:
             sql.append(f"{prefix}{col} IN ({','.join(keys)})")
     if durs:
-        conds = [DUR_SQL[d] for d in durs if d in DUR_SQL]
-        if conds:
-            sql.append("(" + " OR ".join(conds) + ")")
+        # 累积阈值：多选时取最宽松的一档（">30s OR >5min" 等价于 ">30s"），
+        # 前端已做成单选，这里只是容错，避免旧链接带多个值时报错。
+        ths = [DUR_THRESH[d] for d in durs if d in DUR_THRESH]
+        if ths:
+            params["durmin"] = min(ths)
+            # 限定 kind='video'：duration 只有视频才有值，但音频等其他类型也可能写入，
+            # 不限定会和 facets 的「视频口径」计数对不上（1018 vs 1191）
+            sql.append(f"{prefix}kind = 'video' AND {prefix}duration >= :durmin")
     return (" AND " + " AND ".join(sql)) if sql else "", params
 
 
