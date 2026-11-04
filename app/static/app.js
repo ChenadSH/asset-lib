@@ -37,7 +37,8 @@ const DUR_LABEL = {
 const ORIENT_LABEL = { h: '横屏', v: '竖屏', sq: '方图' };
 
 function fmtDur(s) {
-  if (s == null || isNaN(s)) return '';
+  // 探测失败的视频标 -1，不能渲染成「-1 秒」
+  if (s == null || isNaN(s) || s < 0) return '';
   s = Math.round(s);
   if (s < 60) return s + ' 秒';
   const m = Math.floor(s / 60), r = s % 60;
@@ -318,7 +319,7 @@ function renderCard(it) {
     card.appendChild(el('div', 'badge frames',
       hit ? `第 ${it.frame + 1}/${it.frames} 帧` : `${it.frames} 帧`));
   }
-  if (it.kind === 'video' && it.duration != null) {
+  if (it.kind === 'video' && it.duration > 0) {
     card.appendChild(el('div', 'badge dur', fmtDur(it.duration)));
   } else if (it.orient === 'h' || it.orient === 'v') {
     card.appendChild(el('div', 'badge dur', it.orient === 'h' ? '横屏' : '竖屏'));
@@ -328,7 +329,7 @@ function renderCard(it) {
   const cap = el('div', 'cap');
   cap.appendChild(el('div', 'nm', hl(it.name, state.q)));
   let sub = `${(it.ext || '').toUpperCase()} · ${fmtSize(it.size)}`;
-  if (it.kind === 'video' && it.duration != null) sub += ` · ${fmtDur(it.duration)}`;
+  if (it.kind === 'video' && it.duration > 0) sub += ` · ${fmtDur(it.duration)}`;
   if (it.orient) sub += ` · ${ORIENT_LABEL[it.orient] || it.orient}`;
   if (it.match === 'fingerprint') sub += ` · 指纹一致 d=${it.dist}`;
   else if (typeof it.score === 'number') sub += ` · 相似 ${Math.round(it.score * 100)}%`;
@@ -360,7 +361,7 @@ function openLightbox(it) {
   $('#lbMeta').textContent = [
     (it.ext || '').toUpperCase(), fmtSize(it.size), fmtDate(it.mtime),
     it.year ? it.year + ' 年' : '', it.top || '',
-    it.kind === 'video' && it.duration != null ? fmtDur(it.duration) : '',
+    it.kind === 'video' && it.duration > 0 ? fmtDur(it.duration) : '',
     it.orient ? (ORIENT_LABEL[it.orient] || it.orient) : '',
     it.kind === 'video' && it.frames ? `已抽 ${it.frames} 帧` : ''
   ].filter(Boolean).join(' · ');

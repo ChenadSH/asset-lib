@@ -747,7 +747,9 @@ def _item(r, score=None, dist=None, frame=None) -> dict:
         "frames": n_frames,
         "frame": fi if n_frames else None,
         "frame_key": key if n_frames else None,
-        "duration": r["duration"] if "duration" in r.keys() else None,
+        # 探测失败的视频标 -1，对外统一当「未知」
+        "duration": (r["duration"] if "duration" in r.keys() and (r["duration"] or 0) >= 0
+                     else None),
         "orient": (r["orient"] if r["kind"] in ("video", "raster") else None)
                   if "orient" in r.keys() else None,
         "score": None if score is None else round(float(score), 4),

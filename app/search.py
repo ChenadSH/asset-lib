@@ -100,7 +100,8 @@ def _row_to_item(r) -> dict:
         "year": r["year"],
         "thumb": f"/thumb/{r['dev']}_{r['ino']}" if r["thumb"] == 1 else None,
         "frames": int(r["frame_count"] or 0) if r["kind"] == "video" else 0,
-        "duration": r["duration"],
+        # 探测失败的视频标 -1，对外统一当「未知」，别让前端渲染出「-1 秒」
+        "duration": r["duration"] if (r["duration"] or 0) >= 0 else None,
         "orient": r["orient"] if r["kind"] in ("video", "raster") else None,
         "score": None,
         "same_source": False,
