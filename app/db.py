@@ -30,6 +30,15 @@ CREATE TABLE IF NOT EXISTS files (
   -- frames_done = 已编码向量的帧数（断点续跑指针）
   frame_count INTEGER DEFAULT 0,
   frames_done INTEGER DEFAULT 0,
+  -- 筛选用派生字段（迁移自动补列）：
+  -- mtype = 用户视角素材类型（PPT/TIFF 从 kind 里拆出来了）
+  -- duration 秒（仅视频）；width/height 取自缩略图（长宽比与原文件一致）；
+  -- orient = h 横屏 / v 竖屏 / sq 方图
+  mtype    TEXT,
+  duration REAL,
+  width    INTEGER,
+  height   INTEGER,
+  orient   TEXT,
   UNIQUE(dev, ino)
 );
 CREATE INDEX IF NOT EXISTS idx_kind   ON files(kind);
@@ -116,6 +125,23 @@ def init_db(path: Path | None = None) -> None:
             con.execute("ALTER TABLE files ADD COLUMN frame_count INTEGER DEFAULT 0")
         if "frames_done" not in cols:
             con.execute("ALTER TABLE files ADD COLUMN frames_done INTEGER DEFAULT 0")
+        # 筛选派生列（mtype/duration/width/height/orient）
+        for cname, ddl in (("mtype", "TEXT"), ("duration", "REAL"),
+                           ("width", "INTEGER"), ("height", "INTEGER"),
+                           ("orient", "TEXT")):
+            if cname not in cols:
+                con.execute(f"ALTER TABLE files ADD COLUMN {cname} {ddl}")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_mtype  ON files(mtype)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_orient ON files(orient)")
+        # mtype 由扩展名纯派生，直接回填历史数据（27 万行 < 5s）
+        if con.execute("SELECT count(*) c FROM files WHERE mtype IS NULL").fetchone()["c"]:
+            from .config import MTYPE_MAP
+            for mt, exts in MTYPE_MAP.items():
+                con.execute(
+                    f"UPDATE files SET mtype='{mt}' WHERE mtype IS NULL "
+                    f"AND lower(ext) IN ({','.join('?' * len(exts))})", tuple(exts))
+            con.execute("UPDATE files SET mtype='other' WHERE mtype IS NULL")
+        con.commit()
         vcols = {r[1] for r in con.execute("PRAGMA table_info(video_vec_map)")}
         if vcols and "frame_idx" not in vcols:
             con.execute("ALTER TABLE video_vec_map ADD COLUMN frame_idx INTEGER DEFAULT 0")

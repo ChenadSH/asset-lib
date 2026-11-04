@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from .config import CFG, Config, INDEXABLE, classify
+from .config import CFG, Config, INDEXABLE, classify, mtype_of
 from .db import TRIGGERS, connect, get_meta, set_meta
 
 log = logging.getLogger("scanner")
@@ -198,12 +198,12 @@ def scan(cfg: Config | None = None, progress: Callable[[str], None] | None = Non
             if old is None:
                 rel = os.path.relpath(path, root)
                 top = rel.split(os.sep)[0] if os.sep in rel else ""
-                new_rows.append((dev, ino, path, Path(path).stem, ext, kind, size, mtime,
-                                 top, _guess_year(rel), "ready", now))
+                new_rows.append((dev, ino, path, Path(path).stem, ext, kind, mtype_of(ext),
+                                 size, mtime, top, _guess_year(rel), "ready", now))
             else:
                 fid, old_path, old_size, old_mtime, old_status = old
                 if old_path != path:
-                    moved.append((path, Path(path).stem, ext, size, mtime,
+                    moved.append((path, Path(path).stem, ext, mtype_of(ext), size, mtime,
                                   os.path.relpath(path, root).split(os.sep)[0], fid))
                 elif old_size != size or old_mtime != mtime:
                     changed.append((size, mtime, now, fid))
@@ -229,8 +229,8 @@ def scan(cfg: Config | None = None, progress: Callable[[str], None] | None = Non
             for i in range(0, len(new_rows), CHUNK):
                 con.executemany(
                     "INSERT OR IGNORE INTO files"
-                    "(dev,ino,path,name,ext,kind,size,mtime,top,year,status,seen_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", new_rows[i:i + CHUNK])
+                    "(dev,ino,path,name,ext,kind,mtype,size,mtime,top,year,status,seen_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", new_rows[i:i + CHUNK])
                 con.commit()
                 if len(new_rows) > CHUNK:
                     say(f"入库 {min(i + CHUNK, len(new_rows))}/{len(new_rows)}")
@@ -240,7 +240,7 @@ def scan(cfg: Config | None = None, progress: Callable[[str], None] | None = Non
                             changed)
 
         if moved:
-            con.executemany("UPDATE files SET path=?, name=?, ext=?, size=?, mtime=?, top=? WHERE id=?", moved)
+            con.executemany("UPDATE files SET path=?, name=?, ext=?, mtype=?, size=?, mtime=?, top=? WHERE id=?", moved)
 
         if missing:
             con.executemany("UPDATE files SET status='missing' WHERE id=?", [(i,) for i in missing])

@@ -322,6 +322,18 @@ def hamming(a: int, b: int) -> int:
     return bin((a ^ b) & 0xFFFFFFFFFFFFFFFF).count("1")
 
 
+def orient_of(w: int | None, h: int | None) -> str | None:
+    """按长宽比判横竖屏。1.05 以内视为方图（正方形海报很常见，单列一类）。"""
+    if not w or not h:
+        return None
+    r = w / h
+    if r > 1.05:
+        return "h"
+    if r < 1 / 1.05:
+        return "v"
+    return "sq"
+
+
 def save_thumb(im: Image.Image, dest: str, max_side: int = 448, quality: int = 82) -> bool:
     try:
         im = im.copy()

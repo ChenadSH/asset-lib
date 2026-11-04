@@ -19,8 +19,8 @@ from concurrent.futures import ThreadPoolExecutor
 from .config import CFG, Config
 from .db import connect
 from .extract import (VIDEO_SKIP, cleanup_video_frames, extract,
-                      extract_video_frames, ffmpeg_bin, grab_frame, phash,
-                      plan_video_frames, save_thumb, video_duration)
+                      extract_video_frames, ffmpeg_bin, grab_frame, orient_of,
+                      phash, plan_video_frames, save_thumb, video_duration)
 
 log = logging.getLogger("worker")
 
@@ -98,7 +98,10 @@ class ThumbWorker:
             ph = phash(im)
             if not save_thumb(im, dest, self.cfg.thumb_max_side, self.cfg.thumb_quality):
                 return (row["qid"], fid, 0, None, "save_failed", None)
-            return (row["qid"], fid, 1, ph, None, None)
+            # extract 返回原图，宽高即原始分辨率
+            extra = {"width": im.width, "height": im.height,
+                     "orient": orient_of(im.width, im.height)}
+            return (row["qid"], fid, 1, ph, None, extra)
         except Exception as ex:  # noqa: BLE001
             return (row["qid"], fid, 0, None, f"{type(ex).__name__}: {ex}"[:200], None)
 
@@ -140,7 +143,7 @@ class ThumbWorker:
             im0 = grab_frame(row["path"], t0, self.cfg.thumb_max_side)
             if im0 is not None and save_thumb(im0, dest, self.cfg.thumb_max_side,
                                              self.cfg.thumb_quality):
-                self._mark_ready(fid, dest)
+                self._mark_ready(fid, dest, dur, im0.width, im0.height)
 
         saved = extract_video_frames(row["path"], base, n,
                                      self.cfg.thumb_max_side,
@@ -149,14 +152,20 @@ class ThumbWorker:
         if saved == 0:
             return (row["qid"], fid, 0, None, "no_frames", None)
         ph = None
+        w = h = None
         try:
             from PIL import Image
-            ph = phash(Image.open(dest))
+            with Image.open(dest) as im:
+                w, h = im.size
+                ph = phash(im)
         except Exception:  # noqa: BLE001
             pass
-        return (row["qid"], fid, 1, ph, None, {"frame_count": saved})
+        return (row["qid"], fid, 1, ph, None,
+                {"frame_count": saved, "duration": round(dur, 2),
+                 "width": w, "height": h, "orient": orient_of(w, h)})
 
-    def _mark_ready(self, fid: int, dest: str) -> None:
+    def _mark_ready(self, fid: int, dest: str, dur: float | None = None,
+                    w: int | None = None, h: int | None = None) -> None:
         """把单个视频提前标成「有缩略图」，不等整批写库。
 
         worker 是 240 个一批才统一写库的，大文件一批能跑十几分钟；
@@ -168,11 +177,20 @@ class ThumbWorker:
             ph = phash(Image.open(dest))
         except Exception:  # noqa: BLE001
             pass
+        if not (w and h):
+            try:
+                from PIL import Image
+                with Image.open(dest) as im:
+                    w, h = im.size
+            except Exception:  # noqa: BLE001
+                pass
         for _ in range(3):
             con = None
             try:
                 con = connect()
-                con.execute("UPDATE files SET thumb=1, phash=? WHERE id=?", (ph, fid))
+                con.execute("UPDATE files SET thumb=1, phash=?, duration=?, "
+                            "width=?, height=?, orient=? WHERE id=?",
+                            (ph, dur, w, h, orient_of(w, h), fid))
                 con.commit()
                 return
             except sqlite3.OperationalError:
@@ -191,6 +209,10 @@ class ThumbWorker:
         # 视频帧数写入（r[5] 是 extra dict）
         fc_rows = [(r[5]["frame_count"], r[1]) for r in results
                    if r[2] == 1 and r[5] and "frame_count" in r[5]]
+        # 宽高/横竖屏/时长（图片来自原图尺寸，视频来自代表帧与 probe）
+        dim_rows = [(r[5].get("width"), r[5].get("height"), r[5].get("orient"),
+                     r[5].get("duration"), r[1]) for r in results
+                    if r[2] == 1 and r[5] and ("orient" in r[5] or "duration" in r[5])]
         bad = [(r[4], r[0], r[1]) for r in results if r[2] == 0]
         ok_q = [r[0] for r in results if r[2] == 1]
 
@@ -204,6 +226,9 @@ class ThumbWorker:
                         con.executemany("UPDATE files SET phash=? WHERE id=?", ph_rows)
                     if fc_rows:
                         con.executemany("UPDATE files SET frame_count=?, frames_done=0 WHERE id=?", fc_rows)
+                    if dim_rows:
+                        con.executemany("UPDATE files SET width=?, height=?, orient=?, duration=? WHERE id=?",
+                                        dim_rows)
                 for err, qid, fid in bad:
                     row = con.execute("SELECT attempts FROM queue WHERE id=?", (qid,)).fetchone()
                     att = (row["attempts"] if row else 0) + 1

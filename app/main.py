@@ -184,13 +184,20 @@ def api_search(
     kind: str = "",
     top: str = "",
     year: str = "",
+    mtype: str = "",
+    orient: str = "",
+    dur: str = "",
     offset: int = 0,
     limit: int = Query(60, ge=1, le=200),
 ):
     kinds = [k for k in kind.split(",") if k]
     tops = [t for t in top.split("||") if t] if top else []
     years = [y for y in year.split(",") if y]
-    return S.name_search(q, kinds, tops, years, offset, limit)
+    mtypes = [m for m in mtype.split(",") if m]
+    orients = [o for o in orient.split(",") if o in ("h", "v", "sq")]
+    durs = [d for d in dur.split(",") if d in S.DUR_SQL]
+    return S.name_search(q, kinds, tops, years, offset, limit,
+                         mtypes=mtypes, orients=orients, durs=durs)
 
 
 @app.get("/api/file/{fid}")

@@ -714,7 +714,8 @@ def _fetch_rows(ids) -> dict:
             ph = ",".join("?" * len(chunk))
             for r in con.execute(
                     "SELECT f.id, f.path, f.name, f.ext, f.kind, f.size, f.mtime, f.top,"
-                    " f.year, f.dev, f.ino, f.thumb, f.phash, f.frame_count FROM files f "
+                    " f.year, f.dev, f.ino, f.thumb, f.phash, f.frame_count,"
+                    " f.duration, f.orient FROM files f "
                     "WHERE f.id IN (" + ph + ")",
                     chunk):
                 out[r["id"]] = r
@@ -746,6 +747,9 @@ def _item(r, score=None, dist=None, frame=None) -> dict:
         "frames": n_frames,
         "frame": fi if n_frames else None,
         "frame_key": key if n_frames else None,
+        "duration": r["duration"] if "duration" in r.keys() else None,
+        "orient": (r["orient"] if r["kind"] in ("video", "raster") else None)
+                  if "orient" in r.keys() else None,
         "score": None if score is None else round(float(score), 4),
         "dist": dist,
         "match": "fingerprint" if same else "vector",

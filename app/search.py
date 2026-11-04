@@ -22,7 +22,24 @@ COUNT_CAP = 20000          # 全文检索的命中数上限
 COUNT_CAP_LIKE = 1000      # LIKE 路径的上限：再往上统计要全表扫，实测 1000 是性价比拐点
 RANK_LIMIT = 2000          # 小于此规模用 rank 排序，兼顾相关度
 ROW_COLS = ("f.id, f.path, f.name, f.ext, f.kind, f.size, f.mtime, f.top, f.year, "
-            "f.dev, f.ino, f.thumb, f.phash, f.frame_count")
+            "f.dev, f.ino, f.thumb, f.phash, f.frame_count, f.duration, f.orient")
+
+# 视频时长分桶（秒）。前端 chip 的值就是这里的 key。
+DUR_BUCKETS = [
+    ("s15",  0,    15),
+    ("s60",  15,   60),
+    ("m5",   60,   300),
+    ("m30",  300,  1800),
+    ("m30p", 1800, None),
+]
+DUR_SQL = {
+    "s15":  "f.duration >= 0 AND f.duration <= 15",
+    "s60":  "f.duration > 15 AND f.duration <= 60",
+    "m5":   "f.duration > 60 AND f.duration <= 300",
+    "m30":  "f.duration > 300 AND f.duration <= 1800",
+    "m30p": "f.duration > 1800",
+}
+# 横竖屏：h 横屏 / v 竖屏 / sq 方图（按缩略图长宽比判定，比例在 1.05 内视为方图）
 
 
 def _escape_like(s: str) -> str:
@@ -33,12 +50,15 @@ def _fts_phrase(q: str) -> str:
     return '"' + q.replace('"', '""') + '"'
 
 
-def _filters(kinds, tops, years, prefix="f.") -> tuple[str, dict]:
+def _filters(kinds, tops, years, mtypes=None, orients=None, durs=None,
+             prefix="f.") -> tuple[str, dict]:
     sql, params = [], {}
     for group, (col, vals) in {
         "kind": ("kind", kinds),
         "top": ("top", tops),
         "year": ("year", years),
+        "mtype": ("mtype", mtypes),
+        "orient": ("orient", orients),
     }.items():
         if not vals:
             continue
@@ -57,6 +77,10 @@ def _filters(kinds, tops, years, prefix="f.") -> tuple[str, dict]:
             keys.append(f":{key}")
         if keys:
             sql.append(f"{prefix}{col} IN ({','.join(keys)})")
+    if durs:
+        conds = [DUR_SQL[d] for d in durs if d in DUR_SQL]
+        if conds:
+            sql.append("(" + " OR ".join(conds) + ")")
     return (" AND " + " AND ".join(sql)) if sql else "", params
 
 
@@ -74,6 +98,8 @@ def _row_to_item(r) -> dict:
         "year": r["year"],
         "thumb": f"/thumb/{r['dev']}_{r['ino']}" if r["thumb"] == 1 else None,
         "frames": int(r["frame_count"] or 0) if r["kind"] == "video" else 0,
+        "duration": r["duration"],
+        "orient": r["orient"] if r["kind"] in ("video", "raster") else None,
         "score": None,
         "same_source": False,
     }
@@ -91,12 +117,13 @@ def _sort_page(items: list[dict], q: str) -> list[dict]:
     return sorted(items, key=key)
 
 
-def name_search(q: str, kinds=None, tops=None, years=None, offset: int = 0, limit: int = 60) -> dict:
+def name_search(q: str, kinds=None, tops=None, years=None, offset: int = 0, limit: int = 60,
+                mtypes=None, orients=None, durs=None) -> dict:
     t0 = time.perf_counter()
     q = (q or "").strip()
     con = connect(timeout=8)
     try:
-        where_f, fp = _filters(kinds, tops, years)
+        where_f, fp = _filters(kinds, tops, years, mtypes, orients, durs)
 
         if not q:
             sql = ("SELECT " + ROW_COLS + " FROM files f WHERE f.status='ready'" + where_f +
@@ -208,7 +235,18 @@ def facets() -> dict:
         years = [(r["year"], r["c"]) for r in con.execute(
             "SELECT year, count(*) c FROM files WHERE status='ready' AND year IS NOT NULL "
             "GROUP BY year ORDER BY year DESC")]
-        out = {"kinds": kinds, "tops": tops, "years": years}
+        mtypes = [(r["mtype"], r["c"]) for r in con.execute(
+            "SELECT mtype, count(*) c FROM files WHERE status='ready' "
+            "GROUP BY mtype ORDER BY c DESC")]
+        orients = [(r["orient"], r["c"]) for r in con.execute(
+            "SELECT orient, count(*) c FROM files WHERE status='ready' AND orient IS NOT NULL "
+            "GROUP BY orient ORDER BY c DESC")]
+        durs = [(k, con.execute(
+            f"SELECT count(*) c FROM files f WHERE f.status='ready' "
+            f"AND f.kind='video' AND {cond}")
+            .fetchone()["c"]) for k, cond in DUR_SQL.items()]
+        out = {"kinds": kinds, "tops": tops, "years": years,
+               "mtypes": mtypes, "orients": orients, "durs": durs}
     finally:
         con.close()
     _FACETS_CACHE = (now, out)

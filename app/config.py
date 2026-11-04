@@ -235,6 +235,29 @@ def classify(ext: str) -> str:
     return "other"
 
 
+# ---------------- 素材类型（用户视角，比 kind 更细） ----------------
+# kind 是技术分类（raster 把 jpg 和 tif 混在一起，doc 把 ppt 和 pdf 混在一起），
+# 筛选时用户想找的是「PPT」「TIFF 大图」这类颗粒度，故单独一列 mtype。
+MTYPE_MAP: dict[str, set[str]] = {
+    "image":  {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic", ".heif", ".avif"},
+    "tiff":   {".tif", ".tiff"},
+    "video":  {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".wmv", ".mxf", ".r3d"},
+    "ppt":    {".ppt", ".pptx", ".pptm", ".key"},
+    "doc":    {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".csv", ".txt", ".md"},
+    "design": {".psd", ".psb", ".ai", ".eps", ".indd", ".idml", ".sketch", ".fig", ".xd", ".afdesign"},
+    "raw":    {".dng", ".arw", ".cr2", ".cr3", ".nef", ".orf", ".raf", ".rw2"},
+    "audio":  {".wav", ".mp3", ".aif", ".aiff", ".m4a"},
+}
+_MTYPE_BY_EXT: dict[str, str] = {}
+for _mt, _exts in MTYPE_MAP.items():
+    for _e in _exts:
+        _MTYPE_BY_EXT[_e] = _mt
+
+
+def mtype_of(ext: str | None) -> str:
+    return _MTYPE_BY_EXT.get((ext or "").lower(), "other")
+
+
 # 可进入图像索引的类型
 INDEXABLE = {"raster", "raw", "design", "doc"}
 

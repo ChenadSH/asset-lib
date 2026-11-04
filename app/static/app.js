@@ -6,7 +6,9 @@ const el = (t, c, html) => { const e = document.createElement(t); if (c) e.class
 const state = {
   q: '',
   mode: 'name',
-  kinds: new Set(),
+  mtypes: new Set(),
+  durs: new Set(),
+  orients: new Set(),
   tops: new Set(),
   offset: 0,
   limit: 60,
@@ -22,6 +24,24 @@ const KIND_LABEL = {
   raster: '图片', design: '设计源文件', raw: 'RAW', doc: 'PDF/PPT',
   video: '视频', audio: '音频', other: '其他',
 };
+
+const MTYPE_LABEL = {
+  image: '图片', tiff: 'TIFF', video: '视频', ppt: 'PPT/演示',
+  doc: '文档', design: '设计源文件', raw: 'RAW 原片', audio: '音频',
+};
+const DUR_LABEL = {
+  s15: '≤ 15 秒', s60: '15–60 秒', m5: '1–5 分钟', m30: '5–30 分钟', m30p: '> 30 分钟',
+};
+const ORIENT_LABEL = { h: '横屏', v: '竖屏', sq: '方图' };
+
+function fmtDur(s) {
+  if (s == null || isNaN(s)) return '';
+  s = Math.round(s);
+  if (s < 60) return s + ' 秒';
+  const m = Math.floor(s / 60), r = s % 60;
+  if (m < 60) return m + ':' + String(r).padStart(2, '0');
+  return Math.floor(m / 60) + ':' + String(m % 60).padStart(2, '0') + ':' + String(r).padStart(2, '0');
+}
 
 /* ---------------- 工具 ---------------- */
 function fmtSize(n) {
@@ -108,14 +128,37 @@ async function refreshStatus() {
 
 async function loadFacets() {
   const f = await (await apiFetch('/api/facets', 10000)).json();
-  const kc = $('#kindChips'), tc = $('#topChips');
-  kc.innerHTML = ''; tc.innerHTML = '';
-  f.kinds.filter(k => k[1] > 0).slice(0, 6).forEach(([k, n]) => {
-    const b = el('button', 'chip', `${KIND_LABEL[k] || k}<span class="n">${n.toLocaleString()}</span>`);
+  const mc = $('#mtypeChips'), tc = $('#topChips'),
+        dc = $('#durChips'), oc = $('#orientChips');
+  mc.innerHTML = ''; tc.innerHTML = ''; dc.innerHTML = ''; oc.innerHTML = '';
+  f.mtypes.filter(k => k[1] > 0 && k[0]).forEach(([k, n]) => {
+    const b = el('button', 'chip', `${MTYPE_LABEL[k] || k}<span class="n">${n.toLocaleString()}</span>`);
     b.dataset.v = k;
-    b.onclick = () => { toggleSet(state.kinds, k); b.classList.toggle('on'); reset(); };
-    kc.appendChild(b);
+    b.onclick = () => { toggleSet(state.mtypes, k); b.classList.toggle('on'); reset(); };
+    mc.appendChild(b);
   });
+  if (dc) {
+    (f.durs || []).filter(d => d[1] > 0).forEach(([k, n]) => {
+      const b = el('button', 'chip', `${DUR_LABEL[k] || k}<span class="n">${n.toLocaleString()}</span>`);
+      b.dataset.v = k;
+      b.onclick = () => { toggleSet(state.durs, k); b.classList.toggle('on'); reset(); };
+      dc.appendChild(b);
+    });
+    const dl = el('span', 'flabel', '时长');
+    dc.prepend(dl);
+  }
+  if (oc) {
+    (f.orients || []).filter(o => o[1] > 0 && o[0]).forEach(([o, n]) => {
+      const b = el('button', 'chip', `${ORIENT_LABEL[o] || o}<span class="n">${n.toLocaleString()}</span>`);
+      b.dataset.v = o;
+      b.onclick = () => { toggleSet(state.orients, o); b.classList.toggle('on'); reset(); };
+      oc.appendChild(b);
+    });
+    if (oc.children.length) {
+      const ol = el('span', 'flabel', '画幅');
+      oc.prepend(ol);
+    }
+  }
   f.tops.filter(t => t[1] > 0 && t[0]).slice(0, 6).forEach(([t, n]) => {
     const short = t.length > 24 ? t.slice(0, 23) + '…' : t;
     const b = el('button', 'chip', esc(short));
@@ -160,7 +203,9 @@ async function search(append = false) {
   const params = new URLSearchParams();
   params.set('offset', state.offset);
   params.set('limit', state.limit);
-  if (state.kinds.size) params.set('kind', [...state.kinds].join(','));
+  if (state.mtypes.size) params.set('mtype', [...state.mtypes].join(','));
+  if (state.durs.size) params.set('dur', [...state.durs].join(','));
+  if (state.orients.size) params.set('orient', [...state.orients].join(','));
   if (state.tops.size) params.set('top', [...state.tops].join('||'));
 
   let url;
@@ -236,11 +281,18 @@ function renderCard(it) {
     card.appendChild(el('div', 'badge frames',
       hit ? `第 ${it.frame + 1}/${it.frames} 帧` : `${it.frames} 帧`));
   }
+  if (it.kind === 'video' && it.duration != null) {
+    card.appendChild(el('div', 'badge dur', fmtDur(it.duration)));
+  } else if (it.orient === 'h' || it.orient === 'v') {
+    card.appendChild(el('div', 'badge dur', it.orient === 'h' ? '横屏' : '竖屏'));
+  }
   card.appendChild(tw);
 
   const cap = el('div', 'cap');
   cap.appendChild(el('div', 'nm', hl(it.name, state.q)));
   let sub = `${(it.ext || '').toUpperCase()} · ${fmtSize(it.size)}`;
+  if (it.kind === 'video' && it.duration != null) sub += ` · ${fmtDur(it.duration)}`;
+  if (it.orient) sub += ` · ${ORIENT_LABEL[it.orient] || it.orient}`;
   if (it.match === 'fingerprint') sub += ` · 指纹一致 d=${it.dist}`;
   else if (typeof it.score === 'number') sub += ` · 相似 ${Math.round(it.score * 100)}%`;
   cap.appendChild(el('div', 'sub', sub));
@@ -271,6 +323,8 @@ function openLightbox(it) {
   $('#lbMeta').textContent = [
     (it.ext || '').toUpperCase(), fmtSize(it.size), fmtDate(it.mtime),
     it.year ? it.year + ' 年' : '', it.top || '',
+    it.kind === 'video' && it.duration != null ? fmtDur(it.duration) : '',
+    it.orient ? (ORIENT_LABEL[it.orient] || it.orient) : '',
     it.kind === 'video' && it.frames ? `已抽 ${it.frames} 帧` : ''
   ].filter(Boolean).join(' · ');
   renderFrameStrip(it);
