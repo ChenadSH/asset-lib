@@ -18,6 +18,7 @@ const state = {
   seq: 0,
   lastItems: [],
   imageSearching: false,
+  appendRetries: 0,   // 追加页失败自动重试计数，成功即清零
 };
 
 const KIND_LABEL = {
@@ -227,12 +228,13 @@ async function search(append = false) {
 
     $('#empty').hidden = !(state.total === 0);
     if (state.total === 0) setEmpty('没有匹配的素材', '试试更短的关键词，或者换个筛选条件');
-    const modeTxt = d.mode === 'fts' ? '全文索引' : d.mode === 'like' ? '短词匹配' : '全部素材';
+    const modeTxt = d.mode === 'fts' ? '全文索引' : d.mode === 'like' ? '短词匹配' : '';
     const num = d.total.toLocaleString() + (d.capped ? '+' : '');
+    const shown = `已显示 <b>${Math.min(state.offset, d.total).toLocaleString()}</b> / ${num}`;
+    const head = state.q ? `命中 <b>${num}</b> 条` : `共 <b>${num}</b> 条素材`;
     const tail = d.capped && state.done ? ' · 已达检索上限，加关键词可缩小范围' : '';
-    $('#metaLine').innerHTML = state.q
-      ? `命中 <b>${num}</b> 条 · ${modeTxt} · ${d.took_ms} ms${tail}`
-      : `共 <b>${num}</b> 条素材 · 按修改时间排序${tail}`;
+    $('#metaLine').innerHTML =
+      `${head}${modeTxt ? ' · ' + modeTxt : ''} · ${shown} · ${d.took_ms} ms${tail}`;
     ok = true;
   } catch (e) {
     if (e.name === 'AbortError') {
@@ -248,8 +250,33 @@ async function search(append = false) {
       searchAbort = null;
       $('#loading').hidden = true;
     }
-    // 内容不足一屏时自动再拉一页；交叉观察器可能因元素一直在视口内而不再触发
-    if (ok && mySeq === state.seq) setTimeout(maybeLoadMore, 60);
+    if (ok && mySeq === state.seq) {
+      state.appendRetries = 0;
+      // 内容不足一屏时自动再拉一页；交叉观察器可能因元素一直在视口内而不再触发
+      setTimeout(maybeLoadMore, 60);
+      updateMoreBtn();
+    } else if (!ok && append && mySeq === state.seq) {
+      // 追加页失败（超时/网络抖动）自动重试：用户滚轮已到底、页面不再产生
+      // scroll 事件，若只靠用户再滚一次，列表就会永远停在当前长度（「滚出
+      // 几百个就没了」）。指数退避最多 3 次，仍失败则显示手动「加载更多」。
+      const n = (state.appendRetries || 0) + 1;
+      state.appendRetries = n;
+      if (n <= 3) setTimeout(() => { if (!state.loading && !state.done) search(true); }, 600 * n);
+      else updateMoreBtn(true);
+    } else if (ok === false && !append) {
+      $('#moreBtn').hidden = true;
+    }
+  }
+}
+
+/* 「加载更多」手动兜底：滚动机制万一失效（如异常后观察器不再触发），
+   网格底部始终有一个可点的按钮 */
+function updateMoreBtn(forceShow = false) {
+  const b = $('#moreBtn');
+  if (!b) return;
+  b.hidden = !(forceShow || (!state.done && !state.loading && state.total > state.offset));
+  if (!b.hidden) {
+    b.textContent = `加载更多（已显示 ${state.offset.toLocaleString()} / ${state.total.toLocaleString()}）`;
   }
 }
 
@@ -257,7 +284,9 @@ async function search(append = false) {
 function maybeLoadMore() {
   if (state.mode !== 'name' || state.loading || state.done) return;
   const s = $('#sentinel');
-  if (s && s.getBoundingClientRect().top < window.innerHeight + 600 && state.total > state.offset) {
+  // 1500px ≈ 1.5 屏：视频占位图卡片矮，一页 60 张只推高 ~1900px，
+  // 余量太小会出现「滚到底要停一拍才加载」的顿挫感
+  if (s && s.getBoundingClientRect().top < window.innerHeight + 1500 && state.total > state.offset) {
     search(true);
   }
 }
@@ -811,6 +840,7 @@ new IntersectionObserver(entries => {
 
 // 交叉观察器的兜底：滚动时再确认一次，避免 sentinel 一直在视口内导致不再触发
 window.addEventListener('scroll', () => maybeLoadMore(), { passive: true });
+$('#moreBtn').onclick = () => { if (!state.loading && !state.done) search(true); };
 
 /* 启动 */
 (async function init() {

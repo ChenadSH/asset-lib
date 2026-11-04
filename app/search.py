@@ -129,11 +129,11 @@ def name_search(q: str, kinds=None, tops=None, years=None, offset: int = 0, limi
             sql = ("SELECT " + ROW_COLS + " FROM files f WHERE f.status='ready'" + where_f +
                    " ORDER BY f.mtime DESC LIMIT :lim OFFSET :off")
             rows = con.execute(sql, {**fp, "lim": limit, "off": offset}).fetchall()
+            # 浏览模式精确计数：实测 27 万行 <100ms（带 mtype/orient 过滤走索引更快），
+            # 截断会让「共 20,000+」与类型 chip 的 20,812 对不上，用户以为素材丢了
             total = con.execute(
-                "SELECT count(*) c FROM (SELECT 1 FROM files f WHERE f.status='ready'"
-                + where_f + f" LIMIT {COUNT_CAP + 1})", fp).fetchone()["c"]
-            capped = total > COUNT_CAP
-            total = min(total, COUNT_CAP)
+                "SELECT count(*) c FROM files f WHERE f.status='ready'" + where_f, fp).fetchone()["c"]
+            capped = False
             mode = "browse"
         elif len(q) <= 2:
             mode = "like"
