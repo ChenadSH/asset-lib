@@ -284,8 +284,16 @@ def api_thumb(key: str):
 
 
 # ---------------- 图片搜索 ----------------
+SIM_MAX_LIMIT = 120
+
+
+def _sim_args(limit: int, offset: int) -> tuple[int, int]:
+    """相似检索的分页参数统一收口，避免负 offset / 超大 limit 打穿候选池。"""
+    return max(1, min(limit, SIM_MAX_LIMIT)), max(0, offset)
+
+
 @app.post("/api/similar/stream")
-async def api_similar_stream(file: UploadFile = File(...), limit: int = 60):
+async def api_similar_stream(file: UploadFile = File(...), limit: int = 60, offset: int = 0):
     """流式返回 NDJSON：每行一个阶段事件，前端据此显示真实进度。
 
     不用普通 POST 的原因：首次查询要加载模型（可能十几秒）、上传 PSD 要抽缩略图、
@@ -297,10 +305,11 @@ async def api_similar_stream(file: UploadFile = File(...), limit: int = 60):
     if len(data) > MAX_UPLOAD:
         raise HTTPException(413, f"文件过大（{len(data) / 1024**2:.0f} MB），单次上限 300 MB")
     from . import embed
+    limit, offset = _sim_args(limit, offset)
 
     def gen():
         try:
-            for ev in embed.stream_image_search(data, file.filename or "", limit):
+            for ev in embed.stream_image_search(data, file.filename or "", limit, offset):
                 yield json.dumps(ev, ensure_ascii=False) + "\n"
         except Exception as ex:  # noqa: BLE001
             log.exception("图搜失败")
@@ -313,32 +322,35 @@ async def api_similar_stream(file: UploadFile = File(...), limit: int = 60):
 
 
 @app.post("/api/similar")
-async def api_similar(file: UploadFile = File(...), limit: int = 60):
+async def api_similar(file: UploadFile = File(...), limit: int = 60, offset: int = 0):
     data = await file.read()
     if not data:
         raise HTTPException(400, "空文件")
     if len(data) > MAX_UPLOAD:
         raise HTTPException(413, f"文件过大（{len(data) / 1024**2:.0f} MB），单次上限 300 MB")
     from . import embed
+    limit, offset = _sim_args(limit, offset)
     try:
-        return embed.search_image(data, file.filename or "", limit)
+        return embed.search_image(data, file.filename or "", limit, offset)
     except ValueError as ex:
         raise HTTPException(400, str(ex))
 
 
 @app.get("/api/similar/{fid}")
-def api_similar_by_id(fid: int, limit: int = 60):
+def api_similar_by_id(fid: int, limit: int = 60, offset: int = 0):
     from . import embed
-    return embed.search_by_file_id(fid, limit)
+    limit, offset = _sim_args(limit, offset)
+    return embed.search_by_file_id(fid, limit, offset)
 
 
 @app.get("/api/similar/{fid}/frame/{idx}")
-def api_similar_by_frame(fid: int, idx: int, limit: int = 60):
+def api_similar_by_frame(fid: int, idx: int, limit: int = 60, offset: int = 0):
     """以视频某一帧画面找相似。"""
     from . import embed
     if idx < 0 or idx > 200:
         raise HTTPException(400, "帧序号越界")
-    return embed.search_by_frame(fid, idx, limit)
+    limit, offset = _sim_args(limit, offset)
+    return embed.search_by_frame(fid, idx, limit, offset)
 
 
 @app.get("/api/text-search")

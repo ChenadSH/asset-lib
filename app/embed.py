@@ -489,6 +489,11 @@ def _encode_text(text: str) -> np.ndarray:
 PHASH_SAME = 8            # 汉明距离 ≤ 8 视为同源（同一素材的不同版本/尺寸/裁切）
 PHASH_REFRESH = 15        # 指纹索引后台刷新间隔（秒）
 
+# 相似检索的可翻页范围。向量检索本来就是对全库算一遍余弦，K 取大一点几乎不增加
+# 成本（瓶颈是矩阵乘，不是排序），但固定的 K 才能让 total 在翻页时保持不变。
+SIM_K = 1500              # 参与排名的帧向量条数（去重后约 900–1200 个素材）
+SIM_CAP = 400             # 单次相似检索最多展示的条数（向上翻约 7 页）
+
 UPLOAD_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff",
                ".heic", ".heif", ".avif", ".psd", ".psb", ".ai", ".eps", ".pdf",
                ".pptx", ".ppt", ".dng", ".arw", ".cr2", ".cr3", ".nef", ".orf",
@@ -759,14 +764,21 @@ def _item(r, score=None, dist=None, frame=None) -> dict:
     }
 
 
-def _assemble(qvec, limit: int, fp: list | None = None) -> dict:
+def _assemble(qvec, limit: int, fp: list | None = None,
+              offset: int = 0, exclude: int | None = None) -> dict:
     """两段式：指纹命中（同源，置顶） + CLIP 向量相似（补足）。
 
     指纹命中的 score 是 None —— 它不代表「相似度」，代表「同一张图」，
     前端应当用不同标签呈现，而不是和 CLIP 分数混在一起排序。
+
+    分页：候选池大小固定（SIM_K），total 不随页变化，否则翻一页总数就变，
+    进度条（已显示 X / N）会跳。pool 一次算完再切片，翻页成本与首页相同。
     """
     t0 = time.perf_counter()
     fp = fp or []
+    if exclude is not None:
+        # 排除查询图自身要在切片之前做，否则过滤后每页会少一条
+        fp = [(d, i) for d, i in fp if i != exclude]
     rows = _fetch_rows([fid for _, fid in fp])
     fp_items = []
     for dist, fid in fp:
@@ -776,10 +788,12 @@ def _assemble(qvec, limit: int, fp: list | None = None) -> dict:
     t_fp = (time.perf_counter() - t0) * 1000
 
     seen = {x["id"] for x in fp_items}
+    if exclude is not None:
+        seen.add(exclude)      # 自身也要从向量段剔除，否则「找相似」第一条是自己
     t1 = time.perf_counter()
     vec_items = []
     if qvec is not None:
-        sims, ids, frames = store().normalize_and_search(qvec, max(200, limit * 3))
+        sims, ids, frames = store().normalize_and_search(qvec, SIM_K)
         # 一个视频有多个帧向量：同一视频只占一个位置，但保留「命中的最强帧」，
         # 这样结果卡片直接显示对上的那个画面，而不是永远显示封面。
         best: dict[int, tuple[float, int]] = {}
@@ -800,12 +814,13 @@ def _assemble(qvec, limit: int, fp: list | None = None) -> dict:
 
     fp_items.sort(key=lambda x: x["dist"])
     vec_items.sort(key=lambda x: -(x["score"] or 0))
-    merged = (fp_items + vec_items)[:limit]
-    return {"items": merged, "same_source": len(fp_items),
+    pool = (fp_items + vec_items)[:SIM_CAP]
+    return {"items": pool[offset:offset + limit], "total": len(pool),
+            "same_source": len(fp_items),
             "t_fp_ms": round(t_fp, 1), "t_vec_ms": round(t_vec, 1)}
 
 
-def search_image(data: bytes, filename: str = "", limit: int = 60) -> dict:
+def search_image(data: bytes, filename: str = "", limit: int = 60, offset: int = 0) -> dict:
     """上传图检索（非流式，保留给脚本/兼容用）。"""
     from .extract import phash
     t0 = time.perf_counter()
@@ -815,11 +830,11 @@ def search_image(data: bytes, filename: str = "", limit: int = 60) -> dict:
     t2 = time.perf_counter()
     qv = _encode_image(im) if store().count else None
     t3 = time.perf_counter()
-    fp = phash_index().search(ph, limit=max(80, limit))
-    res = _assemble(qv, limit, fp)
+    fp = phash_index().search(ph, limit=SIM_CAP)
+    res = _assemble(qv, limit, fp, offset)
     t4 = time.perf_counter()
     return {
-        "mode": "image", "total": len(res["items"]), "items": res["items"],
+        "mode": "image", "total": res["total"], "items": res["items"],
         "same_source": res["same_source"],
         "query": {"w": im.width, "h": im.height, "format": fmt, "bytes": len(data)},
         "coverage": coverage(),
@@ -835,7 +850,7 @@ def search_by_image_bytes(data: bytes, limit: int = 60) -> dict:
     return search_image(data, "", limit)
 
 
-def stream_image_search(data: bytes, filename: str, limit: int = 60):
+def stream_image_search(data: bytes, filename: str, limit: int = 60, offset: int = 0):
     """NDJSON 流式检索：每个阶段一行，前端显示的是真实进度而不是假动画。"""
     from .extract import phash
 
@@ -856,13 +871,13 @@ def stream_image_search(data: bytes, filename: str, limit: int = 60):
     yield ev("fingerprint", 26, "计算感知指纹…")
     ph = phash(im)
     idx = phash_index()
-    fp = idx.search(ph, limit=max(80, limit))
+    fp = idx.search(ph, limit=SIM_CAP)
     yield ev("fingerprint_done", 40, f"指纹比对 {idx.n:,} 张 · 同源 {len(fp)} 张")
 
     if store().count == 0:
-        res = _assemble(None, limit, fp)
+        res = _assemble(None, limit, fp, offset)
         yield {"stage": "done", "pct": 100, "text": "完成（仅指纹匹配）", "result": {
-            "mode": "image", "total": len(res["items"]), "items": res["items"],
+            "mode": "image", "total": res["total"], "items": res["items"],
             "same_source": res["same_source"],
             "query": {"w": im.width, "h": im.height, "format": fmt, "bytes": len(data)},
             "coverage": coverage(), "took_ms": round((time.perf_counter() - t0) * 1000, 1)}}
@@ -873,11 +888,11 @@ def stream_image_search(data: bytes, filename: str, limit: int = 60):
     yield ev("encode_done", 72, "编码完成")
 
     yield ev("search", 82, f"向量检索 {store().count:,} 条…")
-    res = _assemble(qv, limit, fp)
+    res = _assemble(qv, limit, fp, offset)
     t4 = time.perf_counter()
 
     yield {"stage": "done", "pct": 100, "text": "完成", "result": {
-        "mode": "image", "total": len(res["items"]), "items": res["items"],
+        "mode": "image", "total": res["total"], "items": res["items"],
         "same_source": res["same_source"],
         "query": {"w": im.width, "h": im.height, "format": fmt, "bytes": len(data)},
         "coverage": coverage(),
@@ -886,7 +901,7 @@ def stream_image_search(data: bytes, filename: str, limit: int = 60):
     }}
 
 
-def search_by_file_id(fid: int, limit: int = 60) -> dict:
+def search_by_file_id(fid: int, limit: int = 60, offset: int = 0) -> dict:
     """库内某文件「找同源/找相似」。
 
     未编码的文件（向量还没跑到）也能用：现场从缩略图编码一份向量，
@@ -914,15 +929,14 @@ def search_by_file_id(fid: int, limit: int = 60) -> dict:
 
     fp = []
     if r["phash"] is not None:
-        fp = [(d, i) for d, i in phash_index().search(r["phash"], limit=max(80, limit)) if i != fid]
-    res = _assemble(qv, limit + 1, fp)
-    items = [x for x in res["items"] if x["id"] != fid][:limit]
-    return {"mode": "image", "total": len(items), "items": items,
+        fp = phash_index().search(r["phash"], limit=SIM_CAP)
+    res = _assemble(qv, limit, fp, offset, exclude=fid)
+    return {"mode": "image", "total": res["total"], "items": res["items"],
             "same_source": res["same_source"], "coverage": coverage(),
             "took_ms": round((time.perf_counter() - t0) * 1000, 1)}
 
 
-def search_by_frame(fid: int, idx: int, limit: int = 60) -> dict:
+def search_by_frame(fid: int, idx: int, limit: int = 60, offset: int = 0) -> dict:
     """以视频第 idx 帧画面找相似。
 
     帧向量早已入库（video_vec_map），直接取那一行即可，不必重新跑 CLIP；
@@ -962,15 +976,8 @@ def search_by_frame(fid: int, idx: int, limit: int = 60) -> dict:
         except Exception as ex:  # noqa: BLE001
             log.debug("帧现场编码失败 fid=%s f%d: %s", fid, idx, ex)
 
-    res = _assemble(qv, limit + 1)
-    items = [x for x in res["items"] if x["id"] != fid][:limit]
-    return {"mode": "image", "total": len(items), "items": items,
-            "same_source": res["same_source"], "coverage": coverage(),
-            "took_ms": round((time.perf_counter() - t0) * 1000, 1)}
-
-    res = _assemble(qv, limit + 1)
-    items = [x for x in res["items"] if x["id"] != fid][:limit]
-    return {"mode": "image", "total": len(items), "items": items,
+    res = _assemble(qv, limit, None, offset, exclude=fid)
+    return {"mode": "image", "total": res["total"], "items": res["items"],
             "same_source": res["same_source"], "coverage": coverage(),
             "took_ms": round((time.perf_counter() - t0) * 1000, 1)}
 
@@ -980,7 +987,7 @@ def search_by_text(text: str, limit: int = 60) -> dict:
     q = _encode_text(text)
     t1 = time.perf_counter()
     res = _assemble(q, limit)
-    return {"mode": "text", "total": len(res["items"]), "items": res["items"],
+    return {"mode": "text", "total": res["total"], "items": res["items"],
             "coverage": coverage(),
             "took_ms": round((time.perf_counter() - t0) * 1000, 1),
             "breakdown_ms": {"encode": round((t1 - t0) * 1000, 1),

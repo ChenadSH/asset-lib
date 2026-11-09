@@ -18,6 +18,9 @@ const state = {
   seq: 0,
   lastItems: [],
   imageSearching: false,
+  // 图搜的后续分页要靠它重发请求：{type:'upload',file} / {type:'file',id} / {type:'frame',id,frame}
+  sim: null,
+  seen: new Set(),    // 图搜已展示的 id，翻页时去重（向量库可能在两页之间增量刷新）
   appendRetries: 0,   // 追加页失败自动重试计数，成功即清零
 };
 
@@ -220,6 +223,8 @@ function reset() {
   if (state.mode === 'image' && !state.imageSearching) {
     clearQueryThumb(false);
     setMode('name');
+    state.sim = null;
+    state.seen.clear();
   }
   state.offset = 0; state.done = false; state.lastItems = [];
   $('#grid').innerHTML = '';
@@ -321,19 +326,26 @@ function updateMoreBtn(forceShow = false) {
   }
 }
 
-/* 兜底续加载：sentinel 仍在视口附近且还有数据就继续拉 */
+/* 兜底续加载：sentinel 仍在视口附近且还有数据就继续拉。
+   图搜和名称搜索共用同一套滚动机制，只是续页的请求不同（loadSimilar 带原始查询）。 */
 function maybeLoadMore() {
-  if (state.mode !== 'name' || state.loading || state.done) return;
+  if (state.loading || state.done) return;
+  if (state.mode === 'image') {
+    if (!state.sim || state.total <= state.offset) return;
+  } else if (state.mode !== 'name') {
+    return;
+  }
   const s = $('#sentinel');
   // 1500px ≈ 1.5 屏：视频占位图卡片矮，一页 60 张只推高 ~1900px，
   // 余量太小会出现「滚到底要停一拍才加载」的顿挫感
   if (s && s.getBoundingClientRect().top < window.innerHeight + 1500 && state.total > state.offset) {
-    search(true);
+    if (state.mode === 'image') loadSimilar(true); else search(true);
   }
 }
 
 function renderCard(it) {
   const card = el('div', 'card');
+  card.dataset.id = it.id;   // 便于排查去重/重复渲染
   const tw = el('div', 'thumb');
   if (it.thumb) {
     const img = el('img');
@@ -444,7 +456,6 @@ function renderFrameStrip(it) {
 async function searchByFrame(fid, frameIdx, thumbSrc) {
   closeLightbox();
   state.seq++;
-  state.imageSearching = true;
   state.mode = 'image';
   setMode('image');
 
@@ -456,23 +467,8 @@ async function searchByFrame(fid, frameIdx, thumbSrc) {
   $('#qimgClear').hidden = false;
   $('#q').value = '';
   $('#q').placeholder = '视频第 ' + (frameIdx + 1) + ' 帧';
-
-  $('#grid').innerHTML = '';
-  $('#empty').hidden = true;
-  setProgress(25, '按帧找相似…');
-  const t0 = performance.now();
-  try {
-    const r = await fetch(`/api/similar/${fid}/frame/${frameIdx}?limit=60`);
-    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || '服务返回 ' + r.status);
-    const d = await r.json();
-    setProgress(88, '整理结果…');
-    renderImageResult(d, performance.now() - t0);
-  } catch (e) {
-    failProgress('失败');
-    $('#metaLine').innerHTML = `<span class="cov">按帧找相似失败：${esc(e.message)}</span>`;
-  } finally {
-    state.imageSearching = false;
-  }
+  state.sim = { type: 'frame', id: fid, frame: frameIdx };
+  await loadSimilar(false);
 }
 
 /* 拉取台账详情（36 项业务字段 + 源站链接），仅在配置了 meta_db 时有内容 */
@@ -618,43 +614,96 @@ function covNote(cov) {
 async function searchByImage(file) {
   if (!file) return;
   state.seq++;                       // 作废进行中的文本搜索
-  const mySeq = state.seq;
-  state.imageSearching = true;
   state.mode = 'image';
   setMode('image');
   showQueryThumb(file);
   if (!$('#qthumb').hidden) $('#q').placeholder = file.name;
+  state.sim = { type: 'upload', file };
+  await loadSimilar(false);
+}
 
-  $('#grid').innerHTML = '';
-  $('#empty').hidden = true;
-  $('#metaLine').innerHTML = '正在分析这张图…';
-  setProgress(3, '准备中');
+/* 图搜的统一加载器：首页走流式（有真实阶段进度），后续页走同一查询的 offset。
+   之前三种入口（上传 / 按帧 / 按文件）各自 fetch 一次、把 done 写死为 true，
+   所以图搜永远只有 60 条；现在翻页靠 state.sim 描述「当初搜的是什么」。 */
+async function loadSimilar(append = false) {
+  const q = state.sim;
+  if (!q) return;
+  if (state.mode !== 'image') return;
+  if (append && (state.loading || state.done || state.total <= state.offset)) return;
 
-  const fd = new FormData();
-  fd.append('file', file, file.name);
+  if (!append) state.seq++;
+  const mySeq = state.seq;
+  state.loading = true;
+  state.imageSearching = !append;
   const t0 = performance.now();
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), append ? 20000 : 120000);
+
+  if (!append) {
+    state.offset = 0; state.done = false; state.total = 0;
+    state.seen.clear(); state.appendRetries = 0;
+    $('#grid').innerHTML = '';
+    $('#empty').hidden = true;
+    $('#moreBtn').hidden = true;
+    $('#metaLine').innerHTML = '正在分析这张图…';
+    setProgress(3, '准备中');
+  } else {
+    $('#loading').hidden = false;
+  }
+
+  const bucket = append ? 'offset=' + state.offset : 'offset=0';
+  const qs = `${bucket}&limit=${state.limit}`;
 
   try {
-    const resp = await fetch('/api/similar/stream?limit=60', { method: 'POST', body: fd });
-    if (!resp.ok || !resp.body) {
-      const t = await resp.text().catch(() => '');
-      throw new Error(`服务返回 ${resp.status}${t ? '：' + t.slice(0, 120) : ''}`);
+    let d = null;
+    if (q.type === 'upload') {
+      const fd = new FormData();
+      fd.append('file', q.file, q.file.name);
+      const resp = await fetch('/api/similar/stream?' + qs,
+        { method: 'POST', body: fd, signal: ac.signal });
+      if (!resp.ok || !resp.body) {
+        const t = await resp.text().catch(() => '');
+        throw new Error(`服务返回 ${resp.status}${t ? '：' + t.slice(0, 120) : ''}`);
+      }
+      let got = false;
+      await readEvents(resp, ev => {
+        if (mySeq !== state.seq) return;       // 期间用户又发了新搜索，丢弃旧结果
+        if (ev.stage === 'error') throw new Error(ev.text || '解析失败');
+        if (ev.stage === 'done') { got = true; d = ev.result; }
+        else if (!append) setProgress(ev.pct || 0, ev.text);
+      });
+      if (!got) throw new Error('没有收到结果');
+    } else {
+      const url = q.type === 'frame'
+        ? `/api/similar/${q.id}/frame/${q.frame}?${qs}`
+        : `/api/similar/${q.id}?${qs}`;
+      const r = await fetch(url, { signal: ac.signal });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || '服务返回 ' + r.status);
+      d = await r.json();
+      if (!append) setProgress(88, '整理结果…');
     }
-    let got = false;
-    await readEvents(resp, ev => {
-      if (mySeq !== state.seq) return;          // 期间用户又发了新搜索，丢弃旧结果
-      if (ev.stage === 'error') throw new Error(ev.text || '解析失败');
-      if (ev.stage === 'done') { got = true; renderImageResult(ev.result, performance.now() - t0); }
-      else setProgress(ev.pct || 0, ev.text);
-    });
-    if (!got && mySeq === state.seq) throw new Error('没有收到结果');
+    if (mySeq !== state.seq) return;
+    renderImageResult(d, performance.now() - t0, append);
   } catch (e) {
     if (mySeq !== state.seq) return;
     console.error(e);
-    failProgress('搜索失败');
-    $('#metaLine').innerHTML = `<span class="cov">图搜失败：${esc(e.message)}</span>`;
+    if (append) {
+      // 和名称搜索一致：滚动到底后不会再有 scroll 事件，失败必须自己重试
+      const n = (state.appendRetries || 0) + 1;
+      state.appendRetries = n;
+      if (n <= 3) setTimeout(() => { if (!state.loading && !state.done) loadSimilar(true); }, 600 * n);
+      else updateMoreBtn(true);
+    } else {
+      failProgress('搜索失败');
+      $('#metaLine').innerHTML = `<span class="cov">图搜失败：${esc(e.message)}</span>`;
+    }
   } finally {
-    if (mySeq === state.seq) state.imageSearching = false;
+    clearTimeout(timer);
+    if (mySeq === state.seq) {
+      state.loading = false;
+      state.imageSearching = false;
+      $('#loading').hidden = true;
+    }
   }
 }
 
@@ -665,23 +714,45 @@ function setEmpty(title, sub) {
   box.hidden = false;
 }
 
-function renderImageResult(d, clientMs) {
-  state.total = d.total;
-  state.done = true;
-  state.mode = 'image';
-  $('#grid').innerHTML = '';
-  d.items.forEach(it => $('#grid').appendChild(renderCard(it)));
+function renderImageResult(d, clientMs, append = false) {
+  const raw = d.items || [];
+  state.total = d.total || 0;
+  const start = append ? state.offset : 0;
+  if (!append) { state.seen.clear(); $('#grid').innerHTML = ''; }
+
+  let added = 0;
+  raw.forEach(it => {
+    if (state.seen.has(it.id)) return;   // 两页之间向量库可能增量刷新，去重
+    state.seen.add(it.id);
+    $('#grid').appendChild(renderCard(it));
+    added++;
+  });
+  // offset 用的是「服务端翻到第几条」，不能用去重后的 added，否则下一页会重复取
+  state.offset = start + raw.length;
+  if (raw.length < state.limit || state.offset >= state.total) state.done = true;
   $('#empty').hidden = true;
 
+  const shown = Math.min(state.offset, state.total).toLocaleString();
+  const totalTxt = state.total.toLocaleString();
   const b = d.breakdown_ms || {};
-  const parts = [`<b>${d.total}</b> 条结果`];
-  if (d.same_source) parts.push(`<span class="cov">同源 ${d.same_source} 张</span>`);
-  parts.push(`端到端 ${Math.round(clientMs)} ms`);
-  if (b.fingerprint != null) parts.push(`指纹 ${b.fingerprint} ms`);
-  if (b.search != null) parts.push(`检索 ${b.search} ms`);
-  $('#metaLine').innerHTML = parts.join('<span class="sep">·</span>') + covNote(d.coverage);
+  let parts;
+  if (append) {
+    parts = [`共 <b>${totalTxt}</b> 条相似结果`,
+             `已显示 <b>${shown}</b> / ${totalTxt}`,
+             `本页 ${Math.round(clientMs)} ms`];
+    if (state.done && state.total >= 400) parts.push('已达相似检索上限（取最相似的前 400 条）');
+  } else {
+    parts = [`共 <b>${totalTxt}</b> 条相似结果`, `已显示 <b>${shown}</b> / ${totalTxt}`];
+    if (d.same_source) parts.push(`<span class="cov">同源 ${d.same_source} 张</span>`);
+    parts.push(`端到端 ${Math.round(clientMs)} ms`);
+    if (b.fingerprint != null) parts.push(`指纹 ${b.fingerprint} ms`);
+    if (b.search != null) parts.push(`检索 ${b.search} ms`);
+    if (state.total >= 400) parts.push('按相似度取前 400');
+  }
+  $('#metaLine').innerHTML = parts.join('<span class="sep">·</span>')
+    + (append ? '' : covNote(d.coverage));
 
-  if (d.total === 0) {
+  if (d.total === 0 && !append) {
     const cov = d.coverage || {};
     const vp = cov.searchable ? Math.round(cov.vectorized / cov.searchable * 100) : 0;
     setEmpty('没有找到相似素材',
@@ -689,7 +760,9 @@ function renderImageResult(d, clientMs) {
       + '如果这张图来自素材库，可能还没轮到它编码，稍后再试；也可以先用名称搜索定位。');
   }
 
-  finishProgress(`${d.total} 条 · ${Math.round(clientMs)} ms`);
+  if (!append) finishProgress(`${d.total} 条 · ${Math.round(clientMs)} ms`);
+  updateMoreBtn();
+  if (!state.done) setTimeout(maybeLoadMore, 60);
 }
 
 /* ---------------- 事件绑定 ---------------- */
@@ -822,7 +895,6 @@ $('#lbSimilar').onclick = async () => {
   const c = current;
   closeLightbox();
   state.seq++;
-  state.imageSearching = true;
   state.mode = 'image';
   setMode('image');
 
@@ -835,22 +907,8 @@ $('#lbSimilar').onclick = async () => {
   $('#qimgClear').hidden = false;
   $('#q').value = '';
   $('#q').placeholder = c.name;
-
-  $('#grid').innerHTML = '';
-  $('#empty').hidden = true;
-  setProgress(25, '找同源与相似…');
-  const t0 = performance.now();
-  try {
-    const r = await fetch('/api/similar/' + c.id + '?limit=60');    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || '服务返回 ' + r.status);
-    const d = await r.json();
-    setProgress(88, '整理结果…');
-    renderImageResult(d, performance.now() - t0);
-  } catch (e) {
-    failProgress('失败');
-    $('#metaLine').innerHTML = `<span class="cov">找相似失败：${esc(e.message)}</span>`;
-  } finally {
-    state.imageSearching = false;
-  }
+  state.sim = { type: 'file', id: c.id };
+  await loadSimilar(false);
 };
 document.querySelectorAll('[data-close]').forEach(n => n.onclick = closeLightbox);
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeLightbox(); });
@@ -874,14 +932,17 @@ window.addEventListener('drop', e => {
 
 /* 无限滚动 */
 new IntersectionObserver(entries => {
-  if (entries[0].isIntersecting && !state.done && !state.loading && state.mode === 'name') {
-    search(true);
+  if (entries[0].isIntersecting && !state.done && !state.loading) {
+    if (state.mode === 'image') loadSimilar(true); else search(true);
   }
 }, { rootMargin: '800px' }).observe($('#sentinel'));
 
 // 交叉观察器的兜底：滚动时再确认一次，避免 sentinel 一直在视口内导致不再触发
 window.addEventListener('scroll', () => maybeLoadMore(), { passive: true });
-$('#moreBtn').onclick = () => { if (!state.loading && !state.done) search(true); };
+$('#moreBtn').onclick = () => {
+  if (state.loading || state.done) return;
+  if (state.mode === 'image') loadSimilar(true); else search(true);
+};
 
 /* 死角兜底：IntersectionObserver 只在「相交状态发生变化」时回调，
    sentinel 一旦停在本就在视口内，就再也不会回调；而如果这一页内容撑不满一屏，
@@ -889,7 +950,8 @@ $('#moreBtn').onclick = () => { if (!state.loading && !state.done) search(true);
    （4K 屏、浏览器缩放后一屏能放下 60 张卡时必然踩到）。
    低频巡检每 1.2s 确认一次，无变化时只是一次 getBoundingClientRect，开销可忽略。 */
 setInterval(() => {
-  if (state.mode === 'name' && !state.done && !state.loading && state.total > state.offset) {
+  if ((state.mode === 'name' || state.mode === 'image')
+      && !state.done && !state.loading && state.total > state.offset) {
     maybeLoadMore();
   }
 }, 1200);
