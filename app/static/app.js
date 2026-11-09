@@ -129,8 +129,38 @@ async function refreshStatus() {
   } finally { statusPolling = false; }
 }
 
+/* facets 拉取失败时不能把筛选区清成空白：服务刚启动那 1~2 分钟里
+   /api/facets 会被扫描和模型加载拖到超时，以前一次失败就永久空着，
+   看起来就是「种类用着用着不见了」。这里失败给出可点重试的占位，
+   并在后台自动退避重试几次。 */
+let facetsRetry = 0;
+function facetsFail(e) {
+  const mc = $('#mtypeChips');
+  if (mc.querySelector('button.chip')) return;   // 已有内容就别动它
+  mc.innerHTML = '';
+  const b = el('button', 'chip ghost', '类型加载失败 · 点击重试');
+  b.onclick = () => { b.textContent = '重试中…'; loadFacets(); };
+  mc.appendChild(b);
+  console.warn('facets 加载失败：', e && e.message);
+}
+
 async function loadFacets() {
-  const f = await (await apiFetch('/api/facets', 10000)).json();
+  let f;
+  try {
+    const r = await apiFetch('/api/facets', 12000);
+    if (!r.ok) throw new Error('服务返回 ' + r.status);
+    f = await r.json();
+  } catch (e) {
+    facetsFail(e);
+    if (facetsRetry < 4) { facetsRetry++; setTimeout(loadFacets, 2000 * facetsRetry); }
+    return false;
+  }
+  if (!Array.isArray(f.mtypes) || !f.mtypes.length) {
+    facetsFail(new Error('返回里没有 mtypes'));
+    if (facetsRetry < 4) { facetsRetry++; setTimeout(loadFacets, 2000 * facetsRetry); }
+    return false;
+  }
+  facetsRetry = 0;
   const mc = $('#mtypeChips'), tc = $('#topChips'),
         dc = $('#durChips'), oc = $('#orientChips');
   mc.innerHTML = ''; tc.innerHTML = ''; dc.innerHTML = ''; oc.innerHTML = '';
@@ -140,6 +170,8 @@ async function loadFacets() {
     b.onclick = () => { toggleSet(state.mtypes, k); b.classList.toggle('on'); reset(); };
     mc.appendChild(b);
   });
+  // 只在单一类型时也能看出这行是「类型」筛选（另一个实例只有图片）
+  if (mc.children.length) mc.prepend(el('span', 'flabel', '类型'));
   if (dc) {
     (f.durs || []).filter(d => d[1] > 0).forEach(([k, n]) => {
       const b = el('button', 'chip', `${DUR_LABEL[k] || k}<span class="n">${n.toLocaleString()}</span>`);

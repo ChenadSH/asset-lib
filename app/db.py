@@ -1,12 +1,15 @@
 """SQLite 访问层：建表、连接、迁移。"""
 from __future__ import annotations
 
+import logging
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
 from .config import CFG
+
+log = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
@@ -107,8 +110,12 @@ def connect(path: Path | None = None, readonly: bool = False, timeout: float = 3
     else:
         con = sqlite3.connect(str(p), timeout=timeout)
     con.row_factory = sqlite3.Row
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA synchronous=NORMAL")
+    # 不要在这里执行 `PRAGMA journal_mode=WAL`：它是持久化在库文件头里的属性，
+    # 建库时设一次就够；而每次连接都执行会让它变成一次写操作，扫描/worker
+    # 持写锁时全部接口都卡在这一行直到 timeout（实测 /api/facets 卡死 20s+，
+    # 前端表现为「素材类型整行消失」）。WAL 由 init_db 负责设置。
+    if not readonly:
+        con.execute("PRAGMA synchronous=NORMAL")
     con.execute("PRAGMA temp_store=MEMORY")
     con.execute("PRAGMA cache_size=-200000")  # 约 200MB
     return con
@@ -117,6 +124,11 @@ def connect(path: Path | None = None, readonly: bool = False, timeout: float = 3
 def init_db(path: Path | None = None) -> None:
     con = connect(path)
     try:
+        # WAL 只需在启动时设一次（属性写在库文件里），连接路径上不再重复设置
+        try:
+            con.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError as ex:
+            log.warning("设置 WAL 失败（继续用现有模式）：%s", ex)
         con.executescript(SCHEMA)
         con.executescript(TRIGGERS)
         # 已有库的列迁移：SQLite 的 ALTER 只支持加列，够用

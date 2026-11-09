@@ -241,7 +241,9 @@ def api_reveal(fid: int):
 
 @app.get("/api/facets")
 def api_facets():
-    return S.facets()
+    # 扫描进行中时库里写压力大，计数查询可能从 1.2s 涨到几十秒；
+    # 这时先给上一次的结果，别让前端等到超时（超时就会把类型行清空）
+    return S.facets(allow_stale=bool(_scan_state.get("running")))
 
 
 @app.get("/api/stats")

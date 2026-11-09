@@ -101,7 +101,20 @@ def main() -> None:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "serve"
 
     if cmd in {"serve", "web", "run"}:
+        import socket
         import uvicorn
+
+        # 端口预检：重复双击 start.bat 时，第二个进程会绑不上端口却因为后台
+        # 扫描/模型线程不退而变成僵尸，浏览器那边表现成「接口全超时、筛选项空掉」。
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.settimeout(1.0)
+            busy = probe.connect_ex(("127.0.0.1", CFG.port)) == 0
+        if busy:
+            print(f"[!] 端口 {CFG.port} 已被占用 —— 服务很可能已经在运行了。")
+            print(f"    直接打开 http://{CFG.host}:{CFG.port}/ 即可；")
+            print("    要重启请先关掉旧的服务窗口，再运行本脚本。")
+            raise SystemExit(1)
+
         uvicorn.run("app.main:app", host=CFG.host, port=CFG.port)
         return
 

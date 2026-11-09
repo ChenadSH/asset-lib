@@ -12,6 +12,7 @@ LIKE 配合 idx_status_mtime 索引可提前终止：卫士 34ms / 路虎 1ms。
 from __future__ import annotations
 
 import logging
+import threading
 import time
 
 from .db import connect
@@ -221,37 +222,52 @@ def get_file(fid: int) -> dict | None:
 
 
 _FACETS_CACHE: tuple[float, dict] | None = None
-FACETS_TTL = 60.0    # 三次全表 GROUP BY 实测约 1.2s，前端每次刷新都会拉，缓存 1 分钟
+FACETS_TTL = 60.0    # 几次全表 GROUP BY 实测约 1.2s，前端每次刷新都会拉，缓存 1 分钟
+_FACETS_LOCK = threading.Lock()   # 并发请求同时重算会让每个都卡十几秒
 
 
-def facets() -> dict:
+def facets(allow_stale: bool = False) -> dict:
+    """筛选项计数。
+
+    allow_stale=True 时（扫描/编码正在跑），只要手里有旧结果就先给旧结果：
+    全盘扫描会给库加写压力，实测这几次 GROUP BY 能从 1.2s 涨到 80s+，
+    前端 12s 就超时了 —— 表现就是「类型那行空了」。
+    """
     global _FACETS_CACHE
     now = time.time()
-    if _FACETS_CACHE and now - _FACETS_CACHE[0] < FACETS_TTL:
-        return dict(_FACETS_CACHE[1])
-    con = connect(timeout=8)
+    if _FACETS_CACHE:
+        age = now - _FACETS_CACHE[0]
+        if age < FACETS_TTL or allow_stale:
+            return dict(_FACETS_CACHE[1])
+    if not _FACETS_LOCK.acquire(timeout=12 if allow_stale else -1):
+        # 别人正在重算、手上又有旧值：直接给旧值，别排队
+        return dict(_FACETS_CACHE[1]) if _FACETS_CACHE else {}
     try:
-        kinds = [(r["kind"], r["c"]) for r in con.execute(
-            "SELECT kind, count(*) c FROM files WHERE status='ready' GROUP BY kind ORDER BY c DESC")]
-        tops = [(r["top"], r["c"]) for r in con.execute(
-            "SELECT top, count(*) c FROM files WHERE status='ready' GROUP BY top ORDER BY c DESC")]
-        years = [(r["year"], r["c"]) for r in con.execute(
-            "SELECT year, count(*) c FROM files WHERE status='ready' AND year IS NOT NULL "
-            "GROUP BY year ORDER BY year DESC")]
-        mtypes = [(r["mtype"], r["c"]) for r in con.execute(
-            "SELECT mtype, count(*) c FROM files WHERE status='ready' "
-            "GROUP BY mtype ORDER BY c DESC")]
-        orients = [(r["orient"], r["c"]) for r in con.execute(
-            "SELECT orient, count(*) c FROM files WHERE status='ready' AND orient IS NOT NULL "
-            "GROUP BY orient ORDER BY c DESC")]
-        durs = [(k, con.execute(
-            f"SELECT count(*) c FROM files f WHERE f.status='ready' "
-            f"AND f.kind='video' AND {cond}")
-            .fetchone()["c"]) for k, cond in DUR_SQL.items()]
-        out = {"kinds": kinds, "tops": tops, "years": years,
-               "mtypes": mtypes, "orients": orients, "durs": durs}
+        con = connect(timeout=8)
+        try:
+            kinds = [(r["kind"], r["c"]) for r in con.execute(
+                "SELECT kind, count(*) c FROM files WHERE status='ready' GROUP BY kind ORDER BY c DESC")]
+            tops = [(r["top"], r["c"]) for r in con.execute(
+                "SELECT top, count(*) c FROM files WHERE status='ready' GROUP BY top ORDER BY c DESC")]
+            years = [(r["year"], r["c"]) for r in con.execute(
+                "SELECT year, count(*) c FROM files WHERE status='ready' AND year IS NOT NULL "
+                "GROUP BY year ORDER BY year DESC")]
+            mtypes = [(r["mtype"], r["c"]) for r in con.execute(
+                "SELECT mtype, count(*) c FROM files WHERE status='ready' "
+                "GROUP BY mtype ORDER BY c DESC")]
+            orients = [(r["orient"], r["c"]) for r in con.execute(
+                "SELECT orient, count(*) c FROM files WHERE status='ready' AND orient IS NOT NULL "
+                "GROUP BY orient ORDER BY c DESC")]
+            durs = [(k, con.execute(
+                f"SELECT count(*) c FROM files f WHERE f.status='ready' "
+                f"AND f.kind='video' AND {cond}")
+                .fetchone()["c"]) for k, cond in DUR_SQL.items()]
+            out = {"kinds": kinds, "tops": tops, "years": years,
+                   "mtypes": mtypes, "orients": orients, "durs": durs}
+        finally:
+            con.close()
     finally:
-        con.close()
+        _FACETS_LOCK.release()
     _FACETS_CACHE = (now, out)
     return dict(out)
 
