@@ -883,6 +883,17 @@ new IntersectionObserver(entries => {
 window.addEventListener('scroll', () => maybeLoadMore(), { passive: true });
 $('#moreBtn').onclick = () => { if (!state.loading && !state.done) search(true); };
 
+/* 死角兜底：IntersectionObserver 只在「相交状态发生变化」时回调，
+   sentinel 一旦停在本就在视口内，就再也不会回调；而如果这一页内容撑不满一屏，
+   连 scroll 事件都不会发生 —— 两条路都断，列表就永远停在第 60 条
+   （4K 屏、浏览器缩放后一屏能放下 60 张卡时必然踩到）。
+   低频巡检每 1.2s 确认一次，无变化时只是一次 getBoundingClientRect，开销可忽略。 */
+setInterval(() => {
+  if (state.mode === 'name' && !state.done && !state.loading && state.total > state.offset) {
+    maybeLoadMore();
+  }
+}, 1200);
+
 /* 筛选条会随 chips 数量/窗口宽度换行，高度是动态的；
    meta 行要贴住它吸顶，所以把实测高度写进 CSS 变量，而不是写死 top 值 */
 const filtersEl = $('#filters');
