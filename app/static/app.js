@@ -735,29 +735,33 @@ function renderImageResult(d, clientMs, append = false) {
   const shown = Math.min(state.offset, state.total).toLocaleString();
   const totalTxt = state.total.toLocaleString();
   const b = d.breakdown_ms || {};
+  // 总数由后端按相似度阈值统计（真实匹配数，随查询变化），前端只负责展示
+  const thr = d.min_score != null ? `相似度 ≥ ${Number(d.min_score).toFixed(2)}` : '';
   let parts;
   if (append) {
     parts = [`共 <b>${totalTxt}</b> 条相似结果`,
              `已显示 <b>${shown}</b> / ${totalTxt}`,
              `本页 ${Math.round(clientMs)} ms`];
-    if (state.done && state.total >= 400) parts.push('已达相似检索上限（取最相似的前 400 条）');
+    if (state.done) parts.push(thr ? `已显示全部 · ${thr}` : '已显示全部');
   } else {
     parts = [`共 <b>${totalTxt}</b> 条相似结果`, `已显示 <b>${shown}</b> / ${totalTxt}`];
     if (d.same_source) parts.push(`<span class="cov">同源 ${d.same_source} 张</span>`);
     parts.push(`端到端 ${Math.round(clientMs)} ms`);
     if (b.fingerprint != null) parts.push(`指纹 ${b.fingerprint} ms`);
     if (b.search != null) parts.push(`检索 ${b.search} ms`);
-    if (state.total >= 400) parts.push('按相似度取前 400');
+    if (thr) parts.push(thr);
   }
+  if (d.truncated) parts.push(`结果过多，仅列前 ${totalTxt} 条`);
   $('#metaLine').innerHTML = parts.join('<span class="sep">·</span>')
     + (append ? '' : covNote(d.coverage));
 
   if (d.total === 0 && !append) {
     const cov = d.coverage || {};
     const vp = cov.searchable ? Math.round(cov.vectorized / cov.searchable * 100) : 0;
-    setEmpty('没有找到相似素材',
-      `向量索引目前覆盖 ${vp}%（${(cov.vectorized || 0).toLocaleString()} / ${(cov.searchable || 0).toLocaleString()}）。`
-      + '如果这张图来自素材库，可能还没轮到它编码，稍后再试；也可以先用名称搜索定位。');
+    const t = d.min_score != null ? Number(d.min_score).toFixed(2) : '0.80';
+    setEmpty('没有找到足够相似的素材',
+      `当前只统计相似度 ≥ ${t} 的结果。向量索引覆盖 ${vp}%（${(cov.vectorized || 0).toLocaleString()} / ${(cov.searchable || 0).toLocaleString()}）；`
+      + '如果这张图来自素材库，可能还没轮到它编码，稍后再试；也可以先裁剪到主体再搜，或改用名称搜索。');
   }
 
   if (!append) finishProgress(`${d.total} 条 · ${Math.round(clientMs)} ms`);
